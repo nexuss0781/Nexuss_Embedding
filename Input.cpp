@@ -1,7 +1,8 @@
 // =============================================================================
 // Input.cpp — Tokenizer → HFAQE Bridge
 // =============================================================================
-// Bridges Component-1.1 (EthioBBPE Tokenizer) into the HFAQE embedding layer.
+#ifndef HFAQE_INPUT_CPP
+#define HFAQE_INPUT_CPP
 //
 // Tokenizer interface (from input/Tokenizer.md):
 //   - Python class Tokenizer at ../Component-1.1_Tokenizer/tokenizer.py
@@ -274,3 +275,5 @@ static void input_demo() {
     std::printf("=== Input.cpp Demo Complete ===\n\n");
 }
 
+
+#endif // HFAQE_INPUT_CPP

@@ -1,7 +1,8 @@
 // =============================================================================
 // Train.cpp — HFAQE Training Loop
 // =============================================================================
-// Implements practical training via collaboration with:
+#ifndef HFAQE_TRAIN_CPP
+#define HFAQE_TRAIN_CPP
 //   - EthioBBPE Tokenizer (Component-1.1, via Input.cpp bridge)
 //   - HFAQE Core (Core.cpp) forward + backward + weight update
 //
@@ -545,3 +546,5 @@ static void train_demo() {
     std::printf("=== Train.cpp Demo Complete ===\n\n");
 }
 
+
+#endif // HFAQE_TRAIN_CPP

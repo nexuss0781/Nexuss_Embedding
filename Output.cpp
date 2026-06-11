@@ -1,7 +1,8 @@
 // =============================================================================
 // Output.cpp — HFAQE Clean Public API
 // =============================================================================
-// Exposes the embedding layer to:
+#ifndef HFAQE_OUTPUT_CPP
+#define HFAQE_OUTPUT_CPP
 //   (a) Other C++ translation units / downstream transformer stages
 //   (b) Python via pybind11 (PyTorch-compatible numpy/tensor interface)
 //
@@ -743,3 +744,5 @@ int main() {
 }
 #endif // HFAQE_OUTPUT_MAIN
 
+
+#endif // HFAQE_OUTPUT_CPP

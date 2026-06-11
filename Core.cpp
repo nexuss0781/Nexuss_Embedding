@@ -1,7 +1,8 @@
 // =============================================================================
 // Core.cpp — HFAQE: Hierarchical Frequency-Adaptive Quantized Embedding
 // =============================================================================
-// Spec coverage:
+#ifndef HFAQE_CORE_CPP
+#define HFAQE_CORE_CPP
 //   §1 Mathematical Foundations (Quantization, SVD, Zipf, Cache-Oblivious)
 //   §2 Architecture (Forward, Backward, LM-Head, Init, Weight Tying)
 //   §3 CPU Optimization (AVX-512 microkernels, BLIS matmul, mmap)
@@ -1029,3 +1030,5 @@ struct MemoryBudget {
     }
 };
 
+
+#endif // HFAQE_CORE_CPP

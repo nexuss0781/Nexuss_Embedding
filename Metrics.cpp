@@ -1,7 +1,8 @@
 // =============================================================================
 // Metrics.cpp — HFAQE Hardware Performance & Throughput Monitoring
 // =============================================================================
-// Spec coverage:
+#ifndef HFAQE_METRICS_CPP
+#define HFAQE_METRICS_CPP
 //   §5.5  Performance Tests  — hot gather, cold reconstruct, LM-head speedup
 //   §6.2  Throughput & Memory Results
 //         tokens/sec, LM-head MACs/token, L3 cache miss rate, RSS bound
@@ -647,3 +648,5 @@ static int run_metrics(int V = 16000, int d = 128, int r = 32,
     return fails;
 }
 
+
+#endif // HFAQE_METRICS_CPP
