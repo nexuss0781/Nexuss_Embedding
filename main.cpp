@@ -23,11 +23,17 @@
 
 // Single-TU include chain — include guards in each file prevent ODR violations:
 //   Output.cpp  → Input.cpp → Core.cpp
-//   Train.cpp   → Input.cpp → Core.cpp  (already guarded)
-//   Metrics.cpp → Core.cpp              (already guarded)
+//   Train.cpp   → Storage.cpp → Core.cpp  (already guarded)
+//   Storage.cpp → Core.cpp               (already guarded)
+//   Metrics.cpp → Core.cpp               (already guarded)
+//
+// HFAQE_NO_TRAIN_MAIN suppresses Train.cpp's own main() so it doesn't clash
+// with this file's main().
 // =============================================================================
 
+#define HFAQE_NO_TRAIN_MAIN
 #include "Core.cpp"
+#include "Storage.cpp"
 #include "Input.cpp"
 #include "Train.cpp"
 #include "Metrics.cpp"
@@ -370,8 +376,10 @@ int main(int argc, char** argv) {
     run(1, "Core  — Quantization / SVD / Forward / Backward / LM-Head", run_step_core);
     run(2, "Input — Tokenizer Bridge (stub mode)",                        run_step_input);
     run(3, "Train — Synthetic training loop (1 epoch)",                   run_step_train);
-    run(4, "Metrics — Throughput / MACs / RSS benchmark",                 run_step_metrics);
-    run(5, "Output — Public API (embed_tokens, lm_head, ARC)",            run_step_output);
+    run(4, "Storage — NEX format self-test (write+read+verify)",
+        []() -> bool { return nex_self_test(true); });
+    run(5, "Metrics — Throughput / MACs / RSS benchmark",                 run_step_metrics);
+    run(6, "Output — Public API (embed_tokens, lm_head, ARC)",            run_step_output);
 
     // ---- Final report ----
     std::printf("\n%s", SEP);

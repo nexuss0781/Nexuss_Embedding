@@ -62,6 +62,13 @@ echo ""
 echo "=============================================="
 if [ $EXIT_CODE -eq 0 ]; then
     echo "  RESULT: ALL STEPS PASSED"
+    echo ""
+    echo "  To train on WikiText-2:"
+    echo "    python dataset.py"
+    echo "    g++ -std=c++17 -O3 -march=native $SIMD_FLAGS -I\"$DIR\" \\"
+    echo "        \"$DIR/Train.cpp\" -o \"$DIR/train\" -lm -lpthread"
+    echo "    $DIR/train"
+    echo "    $DIR/train --resume   # resume from checkpoint"
 else
     echo "  RESULT: $EXIT_CODE STEP(S) FAILED"
 fi
