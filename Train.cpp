@@ -775,12 +775,44 @@ int main(int argc, char** argv) {
     adam_A.init(static_cast<size_t>(model.cold.Vc) * cfg.r);
     adam_B.init(static_cast<size_t>(cfg.d)          * cfg.r);
 
-    // ── resume from .nex checkpoint ──────────────────────────────────────────
-    int global_step  = 0;
-    int start_epoch  = 0;
+    // ── AdamW ↔ NexAdamState bridge lambdas ──────────────────────────────────
+    auto to_nex_adam = [&]() -> NexAdamState {
+        NexAdamState ns;
+        ns.m_A    = adam_A.m;  ns.v_A = adam_A.v;  ns.step_A = adam_A.step;
+        ns.m_B    = adam_B.m;  ns.v_B = adam_B.v;  ns.step_B = adam_B.step;
+        return ns;
+    };
+    auto from_nex_adam = [&](const NexAdamState& ns) {
+        adam_A.m = ns.m_A; adam_A.v = ns.v_A; adam_A.step = ns.step_A;
+        adam_B.m = ns.m_B; adam_B.v = ns.v_B; adam_B.step = ns.step_B;
+    };
+
+    // ── CheckpointManager — must be constructed before resume ────────────────
+    CheckpointManager::Config ccfg;
+    ccfg.ckpt_dir  = cfg.ckpt_dir;
+    ccfg.base_name = cfg.ckpt_name;
+    ccfg.compress  = true;
+    ccfg.checksums = true;
+    ccfg.keep_last = 3;
+    CheckpointManager ckpt_mgr(ccfg);
+
+    // ── Training state (declared before lambdas that capture them) ───────────
+    int   global_step   = 0;
+    int   start_epoch   = 0;
     float best_val_loss = 1e9f;
     float best_val_ppl  = 1e9f;
 
+    auto save_ckpt = [&](const std::string& tag) {
+        NexCheckpointMeta nmeta;
+        nmeta.global_step   = global_step;
+        nmeta.epoch         = start_epoch;
+        nmeta.best_val_loss = best_val_loss;
+        nmeta.best_val_ppl  = best_val_ppl;
+        auto ns = to_nex_adam();
+        ckpt_mgr.save(model, nmeta, tag, &ns, &freq);
+    };
+
+    // ── resume from .nex checkpoint ──────────────────────────────────────────
     if (cfg.resume) {
         NexCheckpointMeta loaded_meta;
         NexAdamState      loaded_adam;
@@ -818,41 +850,6 @@ int main(int argc, char** argv) {
     int     accum_steps = 0;
     float   last_gnorm  = 0.0f;
     float   last_lr     = cfg.lr;
-
-    // Helper: convert AdamWState pair → NexAdamState for storage
-    auto to_nex_adam = [&]() -> NexAdamState {
-        NexAdamState ns;
-        ns.m_A    = adam_A.m;
-        ns.v_A    = adam_A.v;
-        ns.m_B    = adam_B.m;
-        ns.v_B    = adam_B.v;
-        ns.step_A = adam_A.step;
-        ns.step_B = adam_B.step;
-        return ns;
-    };
-    auto from_nex_adam = [&](const NexAdamState& ns) {
-        adam_A.m    = ns.m_A; adam_A.v = ns.v_A; adam_A.step = ns.step_A;
-        adam_B.m    = ns.m_B; adam_B.v = ns.v_B; adam_B.step = ns.step_B;
-    };
-
-    // CheckpointManager (owns all .nex save/load logic)
-    CheckpointManager::Config ccfg;
-    ccfg.ckpt_dir  = cfg.ckpt_dir;
-    ccfg.base_name = cfg.ckpt_name;
-    ccfg.compress  = true;
-    ccfg.checksums = true;
-    ccfg.keep_last = 3;
-    CheckpointManager ckpt_mgr(ccfg);
-
-    auto save_ckpt = [&](const std::string& tag) {
-        NexCheckpointMeta nmeta;
-        nmeta.global_step   = global_step;
-        nmeta.epoch         = start_epoch;
-        nmeta.best_val_loss = best_val_loss;
-        nmeta.best_val_ppl  = best_val_ppl;
-        auto ns = to_nex_adam();
-        ckpt_mgr.save(model, nmeta, tag, &ns, &freq);
-    };
 
     // ═════════════════════════════════════════════════════════════════════════
     // Training loop
