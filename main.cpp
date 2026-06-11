@@ -237,70 +237,12 @@ static bool run_step_input() {
 }
 
 // =============================================================================
-// Step 3 — Train demo
-// Exercises: TrainConfig, cross_entropy_lm_loss, train_step, Trainer,
-//            evaluate_perplexity, checkpoint save
 // =============================================================================
-static bool run_step_train() {
-    std::printf("\n[Train] Synthetic training loop ...\n");
-
-    HFAQEConfig cfg;
-    cfg.V = 2000; cfg.d = 64; cfg.r = 16; cfg.K = 200; cfg.B = 64;
-    HFAQE model(cfg);
-    auto freq = zipf_frequencies(cfg.V);
-    model.build_frequency_tiers(freq);
-    model.initialize_weights(7);
-
-    EmbedPipeline pipeline(&model, "");
-
-    // Build tiny synthetic corpus (30 docs)
-    std::mt19937 rng(11);
-    std::vector<std::string> corpus;
-    for (int i = 0; i < 30; ++i) {
-        std::string doc;
-        for (int k = 0; k < 12; ++k)
-            doc += std::to_string(rng() % cfg.V) + " ";
-        corpus.push_back(doc);
-    }
-
-    TrainConfig tcfg;
-    tcfg.lr         = 1e-2f;
-    tcfg.epochs     = 1;
-    tcfg.batch_size = 8;
-    tcfg.max_seq_len = 10;
-    tcfg.log_every  = 4;
-    tcfg.save_every = 9999;  // no save in smoke test
-    tcfg.ckpt_path  = "/tmp/hfaqe_smoke_ckpt.bin";
-
-    // Train on 80% of corpus
-    int n_train = static_cast<int>(corpus.size() * 0.8f);
-    std::vector<std::string> train_set(corpus.begin(), corpus.begin() + n_train);
-    std::vector<std::string> eval_set(corpus.begin() + n_train, corpus.end());
-
-    bool train_ok = false;
-    try {
-        Trainer trainer(model, pipeline, tcfg);
-        trainer.train(train_set);
-
-        float ppl = trainer.evaluate_perplexity(eval_set);
-        std::printf("[Train] eval perplexity = %.2f\n", ppl);
-        train_ok = std::isfinite(ppl) && ppl > 0.0f;
-    } catch (const std::exception& e) {
-        std::printf("[Train] EXCEPTION: %s\n", e.what());
-    }
-
-    // Verify gradient buffer sizes (no O(V·d) spike)
-    size_t grad_q = model.grad_Q.size();  // K×d
-    size_t grad_a = model.grad_A.size();  // (V-K)×r
-    size_t vd     = static_cast<size_t>(cfg.V) * cfg.d;
-    bool no_spike = (grad_q < vd) && (grad_a < vd);
-    std::printf("[Train] grad_Q=%zu  grad_A=%zu  V×d=%zu  no_spike=%s\n",
-        grad_q, grad_a, vd, no_spike ? "YES" : "NO");
-
-    bool ok = train_ok && no_spike;
-    std::printf("[Train] Result: %s\n", ok ? "PASS" : "FAIL");
-    return ok;
-}
+// Step 3 — Train smoke test
+// Delegates entirely to run_step_train() defined in Train.cpp
+// (synthetic data, no Data/ files needed, validates AdamW + NEX checkpoint)
+// run_step_train() is defined in Train.cpp (included above) — no redefinition here.
+// =============================================================================
 
 // =============================================================================
 // Step 4 — Metrics benchmark

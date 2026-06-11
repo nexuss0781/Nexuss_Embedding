@@ -1019,7 +1019,10 @@ public:
         bool  checksums         = true;
     };
 
-    explicit CheckpointManager(Config cfg = {}) : cfg_(std::move(cfg)) {
+    explicit CheckpointManager(const Config& cfg) : cfg_(cfg) {
+        S_MKDIR(cfg_.ckpt_dir.c_str());
+    }
+    explicit CheckpointManager() {
         S_MKDIR(cfg_.ckpt_dir.c_str());
     }
 
