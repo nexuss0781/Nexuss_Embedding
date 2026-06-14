@@ -461,46 +461,6 @@ static LossResult compute_loss(const HFAQE& model,
 }
 
 // =============================================================================
-// Apply AdamW update to cold-tier fp32 parameter arrays, then re-encode bf16
-// =============================================================================
-static void adamw_update_cold_A(HFAQE& model, AdamWState& adam,
-                                 float lr, float beta1, float beta2,
-                                 float eps, float wd)
-{
-    // Work in fp32 scratch, apply AdamW, write back to bf16
-    size_t n = static_cast<size_t>(model.cold.Vc) * model.cfg.r;
-    std::vector<fp32> param_fp32(n);
-    for (size_t i = 0; i < n; ++i)
-        param_fp32[i] = bf16_to_f32(model.cold.A[i]);
-
-    adam.update(param_fp32.data(), model.grad_A.data(), n, lr, beta1, beta2, eps, wd);
-
-    for (size_t i = 0; i < n; ++i)
-        model.cold.A[i] = f32_to_bf16(param_fp32[i]);
-}
-
-static void adamw_update_cold_B(HFAQE& model, AdamWState& adam,
-                                 float lr, float beta1, float beta2,
-                                 float eps, float wd)
-{
-    size_t n = static_cast<size_t>(model.cfg.d) * model.cfg.r;
-    std::vector<fp32> param_fp32(n);
-    for (size_t i = 0; i < n; ++i)
-        param_fp32[i] = bf16_to_f32(model.cold.Basis[i]);
-
-    adam.update(param_fp32.data(), model.grad_B.data(), n, lr, beta1, beta2, eps, wd);
-
-    for (size_t i = 0; i < n; ++i)
-        model.cold.Basis[i] = f32_to_bf16(param_fp32[i]);
-}
-
-// Hot tier: SGD + requantise (DEPRECATED: Now handled by HFAQE::apply_gradients)
-static void sgd_update_hot(HFAQE& model, float lr) {
-    (void)model; (void)lr;
-}
-
-
-// =============================================================================
 // Real-time monitor
 // Prints a compact log line every `log_every` steps, a validation line
 // every `val_every` steps.  Uses \r to overwrite in-progress line.
@@ -946,7 +906,14 @@ int main(int argc, char** argv) {
     } // end epoch loop
 
     // ── Save final checkpoint on interrupt or normal finish ───────────────────
-    save_ckpt("final");
+    NexCheckpointMeta final_meta;
+    final_meta.global_step = model.global_step;
+    final_meta.epoch = epoch;
+    final_meta.best_val_loss = best_val_loss;
+    final_meta.best_val_ppl = best_val_ppl;
+    auto final_ns = to_nex_adam();
+    ckpt_mgr.save(model, final_meta, "final", &final_ns, &freq);
+    
     monitor.log_final(model.global_step, best_val_loss, best_val_ppl);
 
     return 0;
@@ -1246,8 +1213,6 @@ static void run_trainer_s2(TrainConfig& cfg, Stage2Config& s2cfg) {
 
     monitor.log_final(model.global_step, best_val_loss, best_val_ppl);
 }
-
-#endif // HFAQE_TRAIN_CPP
 
 #endif // HFAQE_TRAIN_CPP
 

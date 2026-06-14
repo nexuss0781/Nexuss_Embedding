@@ -432,7 +432,10 @@ public:
                        + (has_freq ? 1 : 0)      // FREQ
                        + 1;                      // META
 
-        // ... rest of write method updates ...
+        // ── Write sections in order ────────────────────────────────────────
+        int sec_idx = 0;
+
+        // AdamW state (Stage 2 Unified or Stage 1 Separated)
         if (has_adam) {
             if (unified_adam) {
                 write_adam_section(sec_idx++, NEX_SEC_ADAM_MM, adam->m_master);
@@ -444,26 +447,6 @@ public:
                 write_adam_section(sec_idx++, NEX_SEC_ADAM_BV, adam->v_B);
             }
         }
-
-        // Build directory (filled in later)
-        directory_.resize(n_sections);
-        std::memset(directory_.data(), 0, n_sections * sizeof(NexSectionEntry));
-
-        // Calculate directory offset and first data offset
-        size_t header_sz    = sizeof(NexHeader);
-        size_t dir_sz       = static_cast<size_t>(n_sections) * sizeof(NexSectionEntry);
-        size_t data_start   = align_up(header_sz + dir_sz, NEX_PAGE_SIZE);
-
-        // Placeholder header + directory — will be overwritten at close()
-        NexHeader hdr; build_header(hdr, model, meta, n_sections, has_adam, has_freq);
-        std::fwrite(&hdr, sizeof(hdr), 1, fp_);
-        std::fwrite(directory_.data(), sizeof(NexSectionEntry), n_sections, fp_);
-
-        // Pad to data_start
-        write_padding(static_cast<size_t>(std::ftell(fp_)), data_start);
-
-        // ── Write sections in order ────────────────────────────────────────
-        int sec_idx = 0;
 
         // HOT_Q — delta-compressed int8 codes
         write_section(sec_idx++, NEX_SEC_HOT_Q,
