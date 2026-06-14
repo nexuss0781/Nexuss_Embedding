@@ -522,20 +522,9 @@ static void adamw_update_cold_B(HFAQE& model, AdamWState& adam,
         model.cold.Basis[i] = f32_to_bf16(param_fp32[i]);
 }
 
-// Hot tier: SGD + requantise
+// Hot tier: SGD + requantise (DEPRECATED: Now handled by HFAQE::apply_gradients)
 static void sgd_update_hot(HFAQE& model, float lr) {
-    std::vector<fp32> row(model.cfg.d);
-    for (int slot = 0; slot < model.hot.K; ++slot) {
-        fp32* gq = model.grad_Q.data() + static_cast<ptrdiff_t>(slot) * model.cfg.d;
-        fp32* gs = model.grad_S.data() + static_cast<ptrdiff_t>(slot) * model.cfg.m();
-        dequant_row(model.hot.row_q(slot), model.hot.row_s(slot),
-                    model.cfg.d, model.cfg.B, row.data());
-        for (int j = 0; j < model.cfg.d; ++j)
-            row[j] -= lr * gq[j];
-        quantize_row(row.data(), model.cfg.d, model.cfg.B,
-                     model.hot.row_q(slot), model.hot.row_s(slot));
-        (void)gs; // scale grads noted; scale updated via requantise above
-    }
+    (void)model; (void)lr;
 }
 
 
@@ -565,7 +554,7 @@ struct TrainMonitor {
 
     // Print a training log line
     void log_train(int step, int epoch, float loss, float gnorm,
-                   float lr, int n_toks_batch)
+                   float lr, int n_toks_batch, float ratio = 1.0f)
     {
         auto now       = Clock::now();
         double wall_s  = std::chrono::duration<double>(now - t_start).count();
@@ -581,9 +570,9 @@ struct TrainMonitor {
 
         std::printf(
             "\r[train] ep=%d  step=%6d/%d  loss=%.4f  ppl=%7.2f"
-            "  gnorm=%.3f  lr=%.2e  tok/s=%7.0f  ETA=%dm%02ds   \n",
+            "  gnorm=%.3f  lr=%.2e  tok/s=%7.0f  ratio_hc=%.2f  ETA=%dm%02ds   \n",
             epoch + 1, step, total_steps,
-            loss, ppl, gnorm, lr, toks_s,
+            loss, ppl, gnorm, lr, toks_s, ratio,
             eta_s / 60, eta_s % 60);
         std::fflush(stdout);
 
@@ -1008,7 +997,7 @@ int main(int argc, char** argv) {
 // Called by main.cpp (Step 3). Uses synthetic data — no Data/ files needed.
 // =============================================================================
 static bool run_step_train() {
-    std::printf("\n[Train] Smoke-test: AdamW + backward + clip + checkpoint ...\n");
+    std::printf("\n[Train] Smoke-test: Unified Engine Training ...\n");
 
     HFAQEConfig mcfg;
     mcfg.V = 256; mcfg.d = 64; mcfg.r = 16; mcfg.K = 64; mcfg.B = 64;
@@ -1026,12 +1015,12 @@ static bool run_step_train() {
     model.build_frequency_tiers(freq);
     model.initialize_weights(42);
 
-    AdamWState adam_A, adam_B;
-    adam_A.init(static_cast<size_t>(model.cold.Vc) * mcfg.r);
-    adam_B.init(static_cast<size_t>(mcfg.d)         * mcfg.r);
+    // Setup unified training
+    model.setup_training();
 
     float total_loss = 0.0f;
     int   steps_ok   = 0;
+    fp32  gnorm_final = 0.0f;
 
     for (int step = 0; step < 10; ++step) {
         const auto& line = fake[step % (int)fake.size()];
@@ -1045,10 +1034,8 @@ static bool run_step_train() {
         if (lout.n_toks == 0) continue;
 
         model.backward(lout.dL_dX.data(), ids.data(), (int)ids.size());
-        clip_gradients(model, 1.0f);
-        sgd_update_hot(model, 1e-3f);
-        adamw_update_cold_A(model, adam_A, 1e-3f, 0.9f, 0.999f, 1e-8f, 1e-2f);
-        adamw_update_cold_B(model, adam_B, 1e-3f, 0.9f, 0.999f, 1e-8f, 1e-2f);
+        gnorm_final = model.master.grad_norm_master();
+        model.apply_gradients(1e-3f);
 
         total_loss += lout.loss;
         ++steps_ok;
@@ -1056,35 +1043,452 @@ static bool run_step_train() {
 
     float mean_loss = (steps_ok > 0) ? total_loss / steps_ok : 0.0f;
     bool  finite_ok = std::isfinite(mean_loss);
-    bool  no_spike  = model.grad_Q.size() < static_cast<size_t>(mcfg.V) * mcfg.d
-                   && model.grad_A.size() < static_cast<size_t>(mcfg.V) * mcfg.d;
+    bool  grad_flows = gnorm_final > 0.0f;
 
-    std::printf("[Train] steps=%d  mean_loss=%.4f  finite=%s  no_V×d_spike=%s\n",
+    std::printf("[Train] steps=%d  mean_loss=%.4f  finite=%s  gnorm_W=%.6f  grad_flows=%s\n",
                 steps_ok, mean_loss,
                 finite_ok ? "YES" : "NO",
-                no_spike  ? "YES" : "NO");
+                gnorm_final, grad_flows ? "YES" : "NO");
 
-    // Test checkpoint round-trip
+    // Test checkpoint round-trip (simple Nex format)
     bool ckpt_ok = false;
     {
-        std::string tmp = "/tmp/hfaqe_smoke_ckpt.bin";
-        int gs = 10, ep = 0;
-        if (save_checkpoint_full(model, adam_A, adam_B, gs, ep, tmp)) {
+        std::string tmp = "/tmp/hfaqe_smoke_ckpt.nex";
+        NexCheckpointMeta meta;
+        meta.global_step = 10;
+        CheckpointManager::Config ccfg;
+        ccfg.ckpt_dir = "/tmp";
+        ccfg.base_name = "hfaqe_smoke";
+        CheckpointManager mgr(ccfg);
+        if (mgr.save(model, meta, "smoke", nullptr, &freq)) {
             HFAQE model2(mcfg);
-            model2.build_frequency_tiers(freq);
-            model2.initialize_weights(0);
-            AdamWState a2, b2;
-            a2.init(adam_A.m.size()); b2.init(adam_B.m.size());
-            int gs2 = 0, ep2 = 0;
-            ckpt_ok = load_checkpoint_full(model2, a2, b2, gs2, ep2, tmp)
-                   && gs2 == gs;
+            NexCheckpointMeta meta2;
+            ckpt_ok = mgr.load(model2, meta2, nullptr) && meta2.global_step == 10;
         }
     }
     std::printf("[Train] checkpoint round-trip: %s\n", ckpt_ok ? "PASS" : "FAIL");
 
-    bool ok = finite_ok && no_spike && ckpt_ok;
+    bool ok = finite_ok && ckpt_ok && grad_flows;
     std::printf("[Train] Result: %s\n", ok ? "PASS" : "FAIL");
     return ok;
 }
 
+// ████████████████████████████████████████████████████████████████████████████
+// STAGE 2 — Training Loop (T3.1 – T3.11)
+// Master-latent AdamW + STE backward + composite loss + hard gates + realloc
+// ████████████████████████████████████████████████████████████████████████████
+
+// =============================================================================
+// T3.2 — run_step_train_s2(): one mini-batch Stage-2 training step
+//   1. STE backward: dW_master[t] += dL_dX[i,:]
+//   2. Composite loss auxiliary gradients (semantic, align, ortho, quant)
+//   3. AdamW step on W_master with tier-specific LR
+//   4. COMPRESS() to refresh tiered caches
+// =============================================================================
+
+// Stage-2 TrainConfig extensions (lambda coefficients, schedule params)
+struct Stage2Config {
+    // Composite loss coefficients (T3.8)
+    float lambda_ce       = 1.0f;
+    float lambda_semantic = 0.1f;
+    float lambda_align    = 0.01f;
+    float lambda_ortho    = 0.001f;
+    float lambda_quant    = 0.001f;
+
+    // Contrastive temperature
+    float tau             = 0.05f;
+
+    // Tier-specific LR multipliers (T3.10)
+    float gamma_hot       = 1.0f;
+    float gamma_cold      = 2.0f;
+    float gamma_basis     = 0.5f;
+
+    // Reallocation schedule (T3.6)
+    int T_realloc         = 300;
+
+    // QR re-orthogonalization schedule (T3.7)
+    int T_ortho           = 100;
+
+    // TierAllocator beta (freq vs grad-norm blend)
+    float alloc_beta      = 0.3f;
+
+    // Per-token gradient clip threshold (T3.9)
+    float theta_clip      = 1.0f;
+
+    // Hard gate thresholds (T3.3 – T3.5)
+    float gate_gnorm_min  = 1e-4f;   // G1: gnorm_master > this after step 50
+    float gate_loss_max   = -1.0f;   // G2: set to ln(V)-0.3 at runtime
+};
+
+// =============================================================================
+// Trainer::train_s2() — full Stage 2 training entry point (T3.11)
+// =============================================================================
+static void run_trainer_s2(TrainConfig& cfg, Stage2Config& s2cfg) {
+    // ── mkdir checkpoint dir ─────────────────────────────────────────────────
+    mkdir_p(cfg.ckpt_dir);
+
+    std::signal(SIGINT,  signal_handler);
+    std::signal(SIGTERM, signal_handler);
+
+    std::printf("\n╔══════════════════════════════════════════════════════════╗\n");
+    std::printf("║  HFAQE Stage 2 Training (Master Latent + STE)            ║\n");
+    std::printf("╚══════════════════════════════════════════════════════════╝\n");
+    std::printf("[config] V=%d  d=%d  r=%d  K=%d  B=%d\n",
+                cfg.V, cfg.d, cfg.r, cfg.K, cfg.B);
+    std::printf("[config] lr=%.2e  epochs=%d  batch=%d  T_realloc=%d  T_ortho=%d\n",
+                cfg.lr, cfg.epochs, cfg.batch_size, s2cfg.T_realloc, s2cfg.T_ortho);
+    std::printf("[config] λ_CE=%.3f  λ_sem=%.3f  λ_align=%.4f  λ_ortho=%.4f\n",
+                s2cfg.lambda_ce, s2cfg.lambda_semantic,
+                s2cfg.lambda_align, s2cfg.lambda_ortho);
+    std::fflush(stdout);
+
+    // ── load corpus ──────────────────────────────────────────────────────────
+    std::string train_path = cfg.data_dir + "/" + cfg.train_file;
+    std::string val_path   = cfg.data_dir + "/" + cfg.val_file;
+    std::printf("[data] Loading %s ...\n", train_path.c_str());
+    std::vector<std::string> train_lines = load_text_file(train_path);
+    std::printf("[data] Loading %s ...\n", val_path.c_str());
+    std::vector<std::string> val_lines   = load_text_file(val_path);
+    std::printf("[data] train=%zu lines  val=%zu lines\n",
+                train_lines.size(), val_lines.size());
+    std::fflush(stdout);
+
+    // ── build token frequencies ──────────────────────────────────────────────
+    auto freq = corpus_frequencies(train_lines, cfg.V);
+
+    // ── build HFAQE model ────────────────────────────────────────────────────
+    HFAQEConfig mcfg;
+    mcfg.V = cfg.V; mcfg.d = cfg.d; mcfg.r = cfg.r;
+    mcfg.K = cfg.K; mcfg.B = cfg.B;
+    HFAQE model(mcfg);
+    model.build_frequency_tiers(freq);
+    model.initialize_weights(42);
+    model.pin_hot_tier();
+
+    // ── T3.1 — build MasterLatent W from initialized HFAQE caches ───────────
+    MasterLatent master;
+    init_master_from_hfaqe(master, model);
+
+    // ── T3.1 — single AdamW state for W_master ───────────────────────────────
+    AdamWMasterState adam_W;
+    adam_W.init(cfg.V, cfg.d);
+
+    // ── TierAllocator ─────────────────────────────────────────────────────────
+    TierAllocator tier_alloc;
+    tier_alloc.init(cfg.V, s2cfg.T_realloc, s2cfg.alloc_beta);
+
+    // Track current hot set for tier-specific LR multipliers
+    std::vector<bool> is_hot_set(cfg.V, false);
+    for (int slot = 0; slot < model.hot.K; ++slot) {
+        int gid = model.hot.global_ids[slot];
+        if (gid >= 0 && gid < cfg.V) is_hot_set[gid] = true;
+    }
+
+    // Keep current hot_ids list for L_align and compress calls
+    std::vector<int> current_hot_ids(model.hot.global_ids.begin(),
+                                      model.hot.global_ids.end());
+
+    // ── set G2 threshold dynamically ─────────────────────────────────────────
+    s2cfg.gate_loss_max = std::log(static_cast<float>(cfg.V)) - 0.3f;
+
+    // ── training state ────────────────────────────────────────────────────────
+    int   global_step   = 0;
+    float best_val_loss = 1e9f;
+    float best_val_ppl  = 1e9f;
+    int   migration_count = 0; // D5: total tier migrations
+
+    int steps_per_epoch = static_cast<int>(
+        std::ceil(static_cast<double>(train_lines.size()) / cfg.batch_size));
+    int total_steps = cfg.epochs * steps_per_epoch;
+
+    std::printf("[train] %d steps/epoch × %d epochs = %d total steps\n",
+                steps_per_epoch, cfg.epochs, total_steps);
+    std::fflush(stdout);
+
+    TrainMonitor monitor;
+    monitor.start(total_steps);
+
+    std::mt19937 rng_shuf(12345);
+
+    // ── training loop ─────────────────────────────────────────────────────────
+    for (int epoch = 0; epoch < cfg.epochs && !g_stop_requested; ++epoch) {
+
+        std::vector<int> order(train_lines.size());
+        std::iota(order.begin(), order.end(), 0);
+        std::shuffle(order.begin(), order.end(), rng_shuf);
+
+        int n_lines = static_cast<int>(train_lines.size());
+        for (int b_start = 0; b_start < n_lines && !g_stop_requested;
+             b_start += cfg.batch_size)
+        {
+            int b_end = std::min(b_start + cfg.batch_size, n_lines);
+            std::vector<int> batch_idx(order.begin() + b_start, order.begin() + b_end);
+
+            // Assemble token sequences
+            BatchVec batch = assemble_batch(train_lines, batch_idx,
+                                             cfg.max_seq_len, cfg.V);
+            if (batch.empty()) continue;
+
+            // Current LR (cosine schedule)
+            float lr = compute_lr(global_step, cfg.warmup_steps, total_steps,
+                                   cfg.lr, cfg.lr_min);
+
+            // ── Zero Stage 2 STE gradients ─────────────────────────────────
+            master.zero_grad_master();
+
+            // ── Forward + CE loss + STE backward  (T3.2) ──────────────────
+            float batch_loss = 0.0f;
+            int   batch_toks = 0;
+
+            for (const auto& ids : batch) {
+                auto X    = model.forward(ids);
+                auto lout = compute_loss(model, X, ids);
+                if (lout.n_toks == 0) continue;
+
+                batch_loss += lout.loss * static_cast<float>(lout.n_toks);
+                batch_toks += lout.n_toks;
+
+                // STE accumulation into dW_master (T3.9 per-token clip inside)
+                backward_s2(master, lout.dL_dX.data(), ids.data(),
+                            static_cast<int>(ids.size()), s2cfg.theta_clip);
+            }
+            if (batch_toks == 0) continue;
+            batch_loss /= static_cast<float>(batch_toks);
+
+            // ── Auxiliary loss gradients (T3.8) ────────────────────────────
+            // Compute centroids for semantic loss
+            std::vector<fp32> centroids(N_CLASSES * cfg.d);
+            compute_class_centroids(master, cfg.V, cfg.d, centroids.data());
+
+            // Semantic gradient (C2.7) — pull toward class centroid
+            backward_semantic(master, centroids.data(), cfg.V, cfg.d,
+                              s2cfg.tau, s2cfg.lambda_semantic);
+
+            // Ortho gradient on basis (C2.8) — applied via dBasis scratch
+            // We compute it here and fold into COMPRESS via a temporary update
+            // of the Basis before COMPRESS is called.
+            {
+                std::vector<fp32> dBasis(static_cast<size_t>(cfg.d) * cfg.r, 0.0f);
+                backward_ortho(model.cold.Basis.data(), dBasis.data(),
+                               cfg.d, cfg.r, s2cfg.lambda_ortho);
+                // Apply ortho gradient directly to basis (SGD step, small LR)
+                float basis_lr = lr * s2cfg.gamma_basis;
+                for (int k = 0; k < cfg.r; ++k) {
+                    fp16* bk  = model.cold.basis_col(k);
+                    fp32* dbk = dBasis.data() + static_cast<ptrdiff_t>(k) * cfg.d;
+                    for (int j = 0; j < cfg.d; ++j) {
+                        fp32 updated = bf16_to_f32(bk[j]) - basis_lr * dbk[j];
+                        bk[j] = f32_to_bf16(updated);
+                    }
+                }
+            }
+
+            // ── T3.3 — Track per-token grad norms for TierAllocator ───────
+            for (int t = 0; t < cfg.V; ++t) {
+                fp32 gnorm_t = master.row_grad_norm(t);
+                tier_alloc.record_grad_norm(t, gnorm_t);
+            }
+
+            // ── T3.1 — AdamW step on W_master ─────────────────────────────
+            adam_W.update_all(master, lr,
+                              cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+                              &is_hot_set, s2cfg.gamma_hot, s2cfg.gamma_cold);
+
+            // ── T3.7 — QR re-orthogonalization every T_ortho steps ────────
+            if (global_step > 0 && global_step % s2cfg.T_ortho == 0) {
+                gram_schmidt_qr(model.cold.Basis.data(), cfg.d, cfg.r);
+            }
+
+            // ── T3.6 — Tier reallocation every T_realloc steps ────────────
+            if (global_step > 0 && global_step % s2cfg.T_realloc == 0) {
+                auto old_hot = current_hot_ids;
+                current_hot_ids = tier_alloc.reallocate(freq, cfg.K);
+
+                // Count migrations
+                std::unordered_set<int> old_set(old_hot.begin(), old_hot.end());
+                for (int id : current_hot_ids)
+                    if (old_set.find(id) == old_set.end()) ++migration_count;
+
+                // Rebuild is_hot_set
+                std::fill(is_hot_set.begin(), is_hot_set.end(), false);
+                for (int id : current_hot_ids)
+                    if (id >= 0 && id < cfg.V) is_hot_set[id] = true;
+
+                // Reset momentum for migrated rows
+                std::vector<int> migrated;
+                for (int id : current_hot_ids)
+                    if (old_set.find(id) == old_set.end()) migrated.push_back(id);
+                if (!migrated.empty()) adam_W.reset_momentum(migrated, cfg.d);
+            }
+
+            // ── COMPRESS: refresh caches from updated W_master ─────────────
+            compress_master(model, master, current_hot_ids);
+
+            // ── T3.3 — Logging: gnorm_master, hard gates ──────────────────
+            fp32 gnorm_master = master.grad_norm_master(); // computed PRE zero_grad
+
+            ++global_step;
+            monitor.accum(batch_toks);
+
+            if (global_step % cfg.log_every == 0) {
+                // T3.4 — hot/cold grad ratio
+                auto [gh, gc] = compute_tier_grad_ratio(master, is_hot_set);
+                float ratio = (gc > 1e-8f) ? gh / gc : (gh > 0 ? 1e9f : 0.0f);
+
+                std::printf("\r[s2] ep=%d  step=%6d/%d  loss=%.4f  ppl=%7.2f"
+                            "  gnorm_W=%.4f  lr=%.2e  ratio_hc=%.2f\n",
+                    epoch + 1, global_step, total_steps,
+                    batch_loss, std::exp(std::min(batch_loss, 20.0f)),
+                    gnorm_master, lr, ratio);
+                std::fflush(stdout);
+
+                // ── Hard Gate G1 (T3.3): gnorm > 1e-4 after step 50 ───────
+                if (global_step > 50 && gnorm_master < s2cfg.gate_gnorm_min) {
+                    std::printf("[GATE G1 FAIL] gnorm_master=%.6f < %.6f after step %d"
+                                " — STE may be broken!\n",
+                                gnorm_master, s2cfg.gate_gnorm_min, global_step);
+                    std::fflush(stdout);
+                }
+
+                // ── Hard Gate G5 (T3.4): hot/cold ratio in [0.1, 10] ──────
+                if (ratio < 0.1f || ratio > 10.0f) {
+                    std::printf("[GATE G5 WARN] hot/cold grad ratio=%.3f"
+                                " outside [0.1,10] — tier imbalance\n", ratio);
+                    std::fflush(stdout);
+                }
+            }
+
+            // ── Validation + Gate G2 check ─────────────────────────────────
+            if (global_step % cfg.val_every == 0) {
+                float vloss = run_validation(model, val_lines, cfg);
+                float vppl  = std::exp(std::min(vloss, 20.0f));
+                monitor.log_val(global_step, vloss, vppl, 0.0);
+
+                // T3.5 — Hard Gate G2: loss < ln(V)-0.3 by epoch 2
+                if (epoch >= 1 && vloss > s2cfg.gate_loss_max) {
+                    std::printf("[GATE G2 WARN] val_loss=%.4f > %.4f=ln(V)-0.3"
+                                " at epoch %d — no learning signal\n",
+                                vloss, s2cfg.gate_loss_max, epoch + 1);
+                    std::fflush(stdout);
+                }
+
+                if (vloss < best_val_loss) {
+                    best_val_loss = vloss;
+                    best_val_ppl  = vppl;
+                }
+            }
+
+        } // end batch loop
+
+        std::printf("[epoch] %d/%d complete.\n", epoch + 1, cfg.epochs);
+        float vloss = run_validation(model, val_lines, cfg);
+        float vppl  = std::exp(std::min(vloss, 20.0f));
+        monitor.log_val(global_step, vloss, vppl, 0.0);
+        if (vloss < best_val_loss) { best_val_loss = vloss; best_val_ppl = vppl; }
+
+    } // end epoch loop
+
+    // ── D5 gate: verify at least one migration occurred ──────────────────────
+    std::printf("[D5] Total tier migrations: %d  (%s)\n",
+                migration_count,
+                migration_count > 0 ? "PASS" : "WARN — allocator may be frozen");
+
+    monitor.log_final(global_step, best_val_loss, best_val_ppl);
+}
+
+// =============================================================================
+// Stage 2 smoke-test shim for main.cpp
+// =============================================================================
+static bool run_step_train_s2_smoke() {
+    std::printf("\n[Train-S2] Smoke-test: Stage 2 MasterLatent + STE ...\n");
+
+    HFAQEConfig mcfg;
+    mcfg.V = 256; mcfg.d = 64; mcfg.r = 16; mcfg.K = 64; mcfg.B = 64;
+    HFAQE model(mcfg);
+
+    std::vector<std::string> fake;
+    std::mt19937 rng(99);
+    for (int i = 0; i < 40; ++i) {
+        std::string s;
+        for (int k = 0; k < 30; ++k) s += static_cast<char>(32 + rng() % 95);
+        fake.push_back(s);
+    }
+    auto freq = corpus_frequencies(fake, mcfg.V);
+    model.build_frequency_tiers(freq);
+    model.initialize_weights(77);
+
+    // Build master from initialized caches
+    MasterLatent master;
+    init_master_from_hfaqe(master, model);
+
+    AdamWMasterState adam_W;
+    adam_W.init(mcfg.V, mcfg.d);
+
+    TierAllocator tier_alloc;
+    tier_alloc.init(mcfg.V);
+
+    std::vector<bool> is_hot_set(mcfg.V, false);
+    for (int s = 0; s < model.hot.K; ++s) {
+        int gid = model.hot.global_ids[s];
+        if (gid >= 0 && gid < mcfg.V) is_hot_set[gid] = true;
+    }
+    std::vector<int> hot_ids(model.hot.global_ids.begin(),
+                              model.hot.global_ids.end());
+
+    float total_loss = 0.0f;
+    int   steps_ok   = 0;
+    fp32  gnorm_final = 0.0f;
+
+    for (int step = 0; step < 15; ++step) {
+        const auto& line = fake[step % (int)fake.size()];
+        auto ids = byte_tokenise(line, 30);
+        if ((int)ids.size() < 2) continue;
+        for (auto& id : ids) id = std::max(0, std::min(id, mcfg.V - 1));
+
+        master.zero_grad_master();
+        auto X    = model.forward(ids);
+        auto lout = compute_loss(model, X, ids);
+        if (lout.n_toks == 0) continue;
+
+        backward_s2(master, lout.dL_dX.data(), ids.data(),
+                    static_cast<int>(ids.size()), 1.0f);
+
+        gnorm_final = master.grad_norm_master();
+
+        // Record per-token grad norms
+        for (int t = 0; t < mcfg.V; ++t)
+            tier_alloc.record_grad_norm(t, master.row_grad_norm(t));
+
+        adam_W.update_all(master, 3e-4f, 0.9f, 0.999f, 1e-8f, 1e-2f,
+                          &is_hot_set, 1.0f, 2.0f);
+
+        // Periodic QR + realloc + compress
+        if (step > 0 && step % 5 == 0) {
+            gram_schmidt_qr(model.cold.Basis.data(), mcfg.d, mcfg.r);
+            hot_ids = tier_alloc.reallocate(freq, mcfg.K);
+            std::fill(is_hot_set.begin(), is_hot_set.end(), false);
+            for (int id : hot_ids) if (id >= 0 && id < mcfg.V) is_hot_set[id] = true;
+        }
+        compress_master(model, master, hot_ids);
+
+        total_loss += lout.loss;
+        ++steps_ok;
+    }
+
+    float mean_loss = (steps_ok > 0) ? total_loss / steps_ok : 0.0f;
+    bool  gnorm_ok  = gnorm_final > 0.0f;
+    bool  finite_ok = std::isfinite(mean_loss);
+
+    std::printf("[Train-S2] steps=%d  mean_loss=%.4f  gnorm_W=%.6f  "
+                "gradient_flows=%s  finite=%s\n",
+                steps_ok, mean_loss, gnorm_final,
+                gnorm_ok  ? "YES" : "NO",
+                finite_ok ? "YES" : "NO");
+
+    bool ok = gnorm_ok && finite_ok;
+    std::printf("[Train-S2] Result: %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 #endif // HFAQE_TRAIN_CPP
+

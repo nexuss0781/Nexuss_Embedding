@@ -307,42 +307,7 @@ public:
     //            the given vector onto the cold basis: α = B^T · v
     // -----------------------------------------------------------------
     void add_cold_token(int new_id, const fp32* init_vec = nullptr) {
-        HFAQE& m = *model_;
-        int d = m.cfg.d;
-        int r = m.cfg.r;
-
-        // Grow vocabulary
-        int new_V = std::max(m.cfg.V, new_id + 1);
-        m.cfg.V   = new_V;
-
-        // Allocate coefficient row α ∈ ℝ^r
-        std::vector<fp16> alpha(r, fp16(0));
-
-        if (init_vec != nullptr) {
-            // Project init_vec onto basis B: α_k = Σ_j B[j,k] · init_vec[j]
-            for (int k = 0; k < r; ++k) {
-                const fp16* bk = m.cold.basis_col(k);
-                fp32 dot = 0.0f;
-                for (int j = 0; j < d; ++j)
-                    dot += bf16_to_f32(bk[j]) * init_vec[j];
-                alpha[k] = f32_to_bf16(dot);
-            }
-        }
-        // else: zero initialisation — new token starts as zero embedding
-        // and learns through backward pass
-
-        // Append to cold tier
-        int new_cslot = m.cold.Vc;
-        m.cold.Vc += 1;
-        m.cold.global_ids.push_back(new_id);
-        m.cold.idx[new_id] = new_cslot;
-
-        // Grow A storage
-        m.cold.A.insert(m.cold.A.end(), alpha.begin(), alpha.end());
-
-        // Grow grad_A if allocated
-        if (!m.grad_A.empty())
-            m.grad_A.resize(m.grad_A.size() + r, 0.0f);
+        model_->add_cold_token(new_id, init_vec);
     }
 
     // Overload: vector init
