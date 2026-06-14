@@ -128,6 +128,7 @@ static inline uint64_t merge_round(uint64_t acc, uint64_t val) {
 }
 
 uint64_t hash(const void* data, size_t len, uint64_t seed = 0) {
+    if (len == 0) return seed + PRIME5;
     const uint8_t* p   = reinterpret_cast<const uint8_t*>(data);
     const uint8_t* end = p + len;
     uint64_t h;

@@ -704,13 +704,29 @@ int main(int argc, char** argv) {
     // ── AdamW ↔ NexAdamState bridge lambdas ──────────────────────────────────
     auto to_nex_adam = [&]() -> NexAdamState {
         NexAdamState ns;
-        ns.m_A    = model.adam_W.m;  ns.v_A = model.adam_W.v;  ns.step_A = model.adam_W.step;
-        // m_B and v_B are not explicitly separated in AdamWMasterState, 
-        // we'll handle this if needed, but for now we store the master states.
+        if (model.training_enabled) {
+            // Stage 2: Unified master state
+            ns.m_master    = model.adam_W.m;
+            ns.v_master    = model.adam_W.v;
+            ns.step_master = model.adam_W.step;
+        } else {
+            // Stage 1 (legacy if needed)
+            ns.m_A = model.adam_W.m; 
+            ns.v_A = model.adam_W.v; 
+            ns.step_A = model.adam_W.step;
+        }
         return ns;
     };
     auto from_nex_adam = [&](const NexAdamState& ns) {
-        model.adam_W.m = ns.m_A; model.adam_W.v = ns.v_A; model.adam_W.step = ns.step_A;
+        if (!ns.m_master.empty()) {
+            model.adam_W.m = ns.m_master;
+            model.adam_W.v = ns.v_master;
+            model.adam_W.step = ns.step_master;
+        } else {
+            model.adam_W.m = ns.m_A;
+            model.adam_W.v = ns.v_A;
+            model.adam_W.step = ns.step_A;
+        }
     };
 
     // ── CheckpointManager — must be constructed before resume ────────────────
