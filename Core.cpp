@@ -1233,6 +1233,27 @@ static std::pair<fp32,fp32> compute_tier_grad_ratio(
 // =============================================================================
 
 
+// =============================================================================
+// C1.5 — COMPRESS: W_master → {Q_H, S_H, A, Basis}
+// Called after each optimizer step (or every T_realloc steps).
+// Accepts new hot_ids (from TierAllocator::reallocate) or derives from
+// existing tier assignment.  Performs:
+//   1. Quantize hot rows from W into (Q_H, S_H)
+//   2. Hard QR re-orthonormalise Basis
+//   3. Project cold rows: A[cslot] = B^T · W[i]  (orthogonal projection)
+// Complexity: O(K·d + d·r² + Vc·d·r)  — called rarely (every 300 steps)
+// =============================================================================
+class HFAQE; // forward decl
+static void compress_master(HFAQE& model, const MasterLatent& master,
+                             const std::vector<int>& new_hot_ids);
+
+// Utility: Initialize MasterLatent from existing HFAQE tiered caches
+// Used when loading a Stage-1 checkpoint and upgrading to Stage-2 training.
+// Dequantizes hot rows, reconstructs cold rows into W_master.
+// =============================================================================
+static void init_master_from_hfaqe(MasterLatent& master, const HFAQE& model);
+
+
 class HFAQE {
 public:
     HFAQEConfig cfg;

@@ -333,6 +333,8 @@ enum NexSectionType : uint32_t {
     NEX_SEC_ADAM_AV   = 0x31,
     NEX_SEC_ADAM_BM   = 0x32,  // fp32[d×r]
     NEX_SEC_ADAM_BV   = 0x33,
+    NEX_SEC_ADAM_MM   = 0x34,  // fp32[V×d] (Unified Master Latent M)
+    NEX_SEC_ADAM_MV   = 0x35,  // fp32[V×d] (Unified Master Latent V)
     NEX_SEC_FREQ      = 0x40,  // fp32[V] token frequency histogram
     NEX_SEC_META      = 0xFF,  // key=value metadata pairs
 };
@@ -357,6 +359,11 @@ struct NexAdamState {
     std::vector<fp32> v_B;
     int step_A = 0;
     int step_B = 0;
+
+    // Unified Master State (HFAQE Stage 2)
+    std::vector<fp32> m_master; // [V × d]
+    std::vector<fp32> v_master;
+    int step_master = 0;
 };
 
 // Full training checkpoint metadata
@@ -417,11 +424,26 @@ public:
         bool has_adam = (adam != nullptr);
         bool has_freq = (freq != nullptr);
 
+        bool unified_adam = has_adam && (!adam->m_master.empty());
+
         int n_sections = 6                       // HOT_Q, HOT_S, HOT_IDS,
                                                  // COLD_A, BASIS, COLD_IDS
-                       + (has_adam ? 4 : 0)      // ADAM_AM, AV, BM, BV
+                       + (has_adam ? (unified_adam ? 2 : 4) : 0) // MM, MV or AM, AV, BM, BV
                        + (has_freq ? 1 : 0)      // FREQ
                        + 1;                      // META
+
+        // ... rest of write method updates ...
+        if (has_adam) {
+            if (unified_adam) {
+                write_adam_section(sec_idx++, NEX_SEC_ADAM_MM, adam->m_master);
+                write_adam_section(sec_idx++, NEX_SEC_ADAM_MV, adam->v_master);
+            } else {
+                write_adam_section(sec_idx++, NEX_SEC_ADAM_AM, adam->m_A);
+                write_adam_section(sec_idx++, NEX_SEC_ADAM_AV, adam->v_A);
+                write_adam_section(sec_idx++, NEX_SEC_ADAM_BM, adam->m_B);
+                write_adam_section(sec_idx++, NEX_SEC_ADAM_BV, adam->v_B);
+            }
+        }
 
         // Build directory (filled in later)
         directory_.resize(n_sections);
@@ -660,7 +682,8 @@ private:
             ss << "notes=" << meta.notes << "\n";
         if (adam) {
             ss << "adam_step_A=" << adam->step_A << "\n"
-               << "adam_step_B=" << adam->step_B << "\n";
+               << "adam_step_B=" << adam->step_B << "\n"
+               << "adam_step_master=" << adam->step_master << "\n";
         }
         return ss.str();
     }
@@ -833,21 +856,31 @@ public:
         if (!has_adam())
             throw std::runtime_error("NexReader: file has no AdamW state");
 
+        auto has_sec = [&](NexSectionType type) {
+            for (auto& e : dir_) if (e.type == static_cast<uint32_t>(type)) return true;
+            return false;
+        };
+
         auto load_vec = [&](NexSectionType type, std::vector<fp32>& vec) {
             auto& e = find_section(type);
             vec.resize(static_cast<size_t>(e.size_bytes) / sizeof(fp32));
             load_raw(type, vec.data(), vec.size() * sizeof(fp32));
         };
 
-        load_vec(NEX_SEC_ADAM_AM, adam.m_A);
-        load_vec(NEX_SEC_ADAM_AV, adam.v_A);
-        load_vec(NEX_SEC_ADAM_BM, adam.m_B);
-        load_vec(NEX_SEC_ADAM_BV, adam.v_B);
-
-        // Read step counts from metadata
-        auto meta_str = load_meta_string();
-        adam.step_A = parse_meta_int(meta_str, "adam_step_A");
-        adam.step_B = parse_meta_int(meta_str, "adam_step_B");
+        if (has_sec(NEX_SEC_ADAM_MM)) {
+            load_vec(NEX_SEC_ADAM_MM, adam.m_master);
+            load_vec(NEX_SEC_ADAM_MV, adam.v_master);
+            auto meta_str = load_meta_string();
+            adam.step_master = parse_meta_int(meta_str, "adam_step_master");
+        } else {
+            load_vec(NEX_SEC_ADAM_AM, adam.m_A);
+            load_vec(NEX_SEC_ADAM_AV, adam.v_A);
+            load_vec(NEX_SEC_ADAM_BM, adam.m_B);
+            load_vec(NEX_SEC_ADAM_BV, adam.v_B);
+            auto meta_str = load_meta_string();
+            adam.step_A = parse_meta_int(meta_str, "adam_step_A");
+            adam.step_B = parse_meta_int(meta_str, "adam_step_B");
+        }
     }
 
     // -------------------------------------------------------------------
