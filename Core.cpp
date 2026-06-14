@@ -574,22 +574,728 @@ static void truncated_svd(const fp32* M, int rows, int cols, int rank,
 // Cold tier: E_C ← N(0,1/d) → truncated SVD → A, B; E_C discarded
 // =============================================================================
 
+
+// =============================================================================
+// STAGE 2 STRUCTURES & MATH HELPERS (PRE-DECLARED)
+// =============================================================================
+// STAGE 2 — High-Quality Embedding Layer Extensions
+// §2 Stage 2 Specification: Latent Master W, STE, TierAllocator, COMPRESS,
+//   Composite Loss, Gram-Schmidt QR, Stage 2 Backward + Optimizer Step
+// ██████████████████████████████████████████████████████████████████████████████
+// =============================================================================
+
+// =============================================================================
+// C1.1 — MasterLatent: bf16 W[V×d] — sole trainable parameter (Stage 2)
+// grad_W: fp32[V×d] — STE gradient accumulator
+// After optimizer step, COMPRESS() refreshes (Q_H, S_H, A, Basis) caches.
+// =============================================================================
+struct MasterLatent {
+    int V, d;
+    std::vector<fp16> W;         // bf16[V×d]  — latent master embedding matrix
+    std::vector<fp32> dW;        // fp32[V×d]  — STE gradient buffer
+
+    void allocate(int V_, int d_) {
+        V = V_; d = d_;
+        W.assign(static_cast<size_t>(V) * d, 0);
+        dW.assign(static_cast<size_t>(V) * d, 0.0f);
+    }
+
+    // Row accessors
+    fp16*       row_w(int t)       { return W.data()  + static_cast<ptrdiff_t>(t) * d; }
+    const fp16* row_w(int t) const { return W.data()  + static_cast<ptrdiff_t>(t) * d; }
+    fp32*       row_dw(int t)      { return dW.data() + static_cast<ptrdiff_t>(t) * d; }
+    const fp32* row_dw(int t) const { return dW.data() + static_cast<ptrdiff_t>(t) * d; }
+
+    // Zero all STE gradients
+    void zero_grad_master() {
+        std::fill(dW.begin(), dW.end(), 0.0f);
+    }
+
+    // STE accumulate: dW[t] += g[d]   (called from backward_s2)
+    void accumulate_grad(int t, const fp32* g) {
+        fp32* dw = row_dw(t);
+        for (int j = 0; j < d; ++j) dw[j] += g[j];
+    }
+
+    // Frobenius norm of the gradient matrix  ‖dW‖_F
+    fp32 grad_norm_master() const {
+        double s = 0.0;
+        for (fp32 v : dW) s += static_cast<double>(v) * v;
+        return static_cast<fp32>(std::sqrt(s));
+    }
+
+    // Frobenius norm of a single row gradient ‖dW[t]‖_2
+    fp32 row_grad_norm(int t) const {
+        const fp32* dw = row_dw(t);
+        double s = 0.0;
+        for (int j = 0; j < d; ++j) s += static_cast<double>(dw[j]) * dw[j];
+        return static_cast<fp32>(std::sqrt(s));
+    }
+
+    // Get fp32 row of W (expand bf16)
+    void get_row_fp32(int t, fp32* out) const {
+        const fp16* w = row_w(t);
+        for (int j = 0; j < d; ++j) out[j] = bf16_to_f32(w[j]);
+    }
+
+    // Set fp32 row of W (compress to bf16)
+    void set_row_fp32(int t, const fp32* in) {
+        fp16* w = row_w(t);
+        for (int j = 0; j < d; ++j) w[j] = f32_to_bf16(in[j]);
+    }
+
+    // Initialize from Gaussian N(0, sigma²)
+    void init_gaussian(fp32 sigma, uint64_t seed = 42) {
+        std::mt19937_64 rng(seed);
+        std::normal_distribution<fp32> dist(0.0f, sigma);
+        for (int t = 0; t < V; ++t) {
+            fp16* w = row_w(t);
+            for (int j = 0; j < d; ++j) w[j] = f32_to_bf16(dist(rng));
+        }
+    }
+};
+
+// =============================================================================
+// C1.7 — Modified Gram-Schmidt QR in-place on bf16 Basis columns
+// Input/Output: Basis[d × r] column-major (col k = Basis + k*d)
+// Ensures B^T·B ≈ I_r  (orthonormal columns)
+// Complexity: O(d·r²)  — called every T_ortho steps
+// =============================================================================
+static void gram_schmidt_qr(fp16* Basis, int d, int r) {
+    // Work in fp32 scratch to avoid bf16 accumulation error
+    std::vector<fp32> Q(static_cast<size_t>(d) * r);
+
+    // Load all columns to fp32
+    for (int k = 0; k < r; ++k) {
+        fp32* qk = Q.data() + static_cast<ptrdiff_t>(k) * d;
+        const fp16* bk = Basis + static_cast<ptrdiff_t>(k) * d;
+        for (int j = 0; j < d; ++j) qk[j] = bf16_to_f32(bk[j]);
+    }
+
+    // Modified Gram-Schmidt orthonormalisation
+    for (int k = 0; k < r; ++k) {
+        fp32* qk = Q.data() + static_cast<ptrdiff_t>(k) * d;
+
+        // Orthogonalise against all previous columns
+        for (int prev = 0; prev < k; ++prev) {
+            const fp32* qp = Q.data() + static_cast<ptrdiff_t>(prev) * d;
+            fp32 dot = 0.0f;
+            for (int j = 0; j < d; ++j) dot += qk[j] * qp[j];
+            for (int j = 0; j < d; ++j) qk[j] -= dot * qp[j];
+        }
+
+        // Normalise column k
+        fp32 norm2 = 0.0f;
+        for (int j = 0; j < d; ++j) norm2 += qk[j] * qk[j];
+        fp32 norm = std::sqrt(norm2);
+        if (norm > 1e-10f) {
+            fp32 inv = 1.0f / norm;
+            for (int j = 0; j < d; ++j) qk[j] *= inv;
+        }
+        // else: degenerate column — leave as-is (rare edge case)
+    }
+
+    // Write orthonormal columns back to bf16
+    for (int k = 0; k < r; ++k) {
+        const fp32* qk = Q.data() + static_cast<ptrdiff_t>(k) * d;
+        fp16* bk = Basis + static_cast<ptrdiff_t>(k) * d;
+        for (int j = 0; j < d; ++j) bk[j] = f32_to_bf16(qk[j]);
+    }
+}
+
+// =============================================================================
+// C1.8 — TierAllocator: gradient-magnitude–aware dynamic hot/cold migration
+// Maintains migration score μ_i = β·freq_i + (1-β)·avg_grad_norm_i
+// =============================================================================
+struct TierAllocator {
+    int V;
+    int T_win;                              // history window length
+    fp32 beta;                              // freq/grad blend (default 0.3)
+
+    std::vector<fp32> mu;                   // migration scores [V]
+    std::vector<fp32> grad_norm_accum;      // running sum of grad norms [V]
+    std::vector<int>  grad_norm_count;      // count of accumulations [V]
+
+    void init(int V_, int T_win_ = 300, fp32 beta_ = 0.3f) {
+        V = V_; T_win = T_win_; beta = beta_;
+        mu.assign(V, 0.0f);
+        grad_norm_accum.assign(V, 0.0f);
+        grad_norm_count.assign(V, 0);
+    }
+
+    // Accumulate per-token gradient norm at each step
+    void record_grad_norm(int t, fp32 gnorm) {
+        if (t < 0 || t >= V) return;
+        grad_norm_accum[t] += gnorm;
+        grad_norm_count[t]++;
+    }
+
+    // Update migration scores and select new hot set (top-K by μ)
+    // Returns sorted list of new hot token IDs (size K)
+    std::vector<int> reallocate(const std::vector<fp32>& freq, int K) {
+        // Compute μ_i = β·freq_i + (1-β)·avg_grad_norm_i
+        for (int t = 0; t < V; ++t) {
+            fp32 avg_g = (grad_norm_count[t] > 0)
+                         ? grad_norm_accum[t] / static_cast<fp32>(grad_norm_count[t])
+                         : 0.0f;
+            mu[t] = beta * freq[t] + (1.0f - beta) * avg_g;
+        }
+
+        // Select top-K by μ
+        std::vector<int> order(V);
+        std::iota(order.begin(), order.end(), 0);
+        std::partial_sort(order.begin(), order.begin() + K, order.end(),
+            [&](int a, int b) { return mu[a] > mu[b]; });
+
+        // Reset accumulations for next window
+        std::fill(grad_norm_accum.begin(), grad_norm_accum.end(), 0.0f);
+        std::fill(grad_norm_count.begin(), grad_norm_count.end(), 0);
+
+        return std::vector<int>(order.begin(), order.begin() + K);
+    }
+};
+
+// =============================================================================
+// C2.1 — Token taxonomy for ASCII byte vocab (V=256)
+// Six semantic classes used by the InfoNCE supervised contrastive loss.
+// =============================================================================
+enum class TokenClass : int {
+    DIGIT = 0,   // '0'..'9'  (10 tokens)
+    UPPER = 1,   // 'A'..'Z'  (26 tokens)
+    LOWER = 2,   // 'a'..'z'  (26 tokens)
+    PUNCT = 3,   // printable non-alnum (33 tokens)
+    SPACE = 4,   // whitespace: 0x09,0x0A,0x0D,0x20 (4 tokens)
+    CTRL  = 5    // everything else (control / high bytes)
+};
+static constexpr int N_CLASSES = 6;
+
+static TokenClass classify_byte(int id) {
+    if (id >= '0' && id <= '9') return TokenClass::DIGIT;
+    if (id >= 'A' && id <= 'Z') return TokenClass::UPPER;
+    if (id >= 'a' && id <= 'z') return TokenClass::LOWER;
+    if (id == 0x09 || id == 0x0A || id == 0x0D || id == 0x20)
+        return TokenClass::SPACE;
+    if (id >= 33 && id <= 126)  return TokenClass::PUNCT;
+    return TokenClass::CTRL;
+}
+
+// =============================================================================
+// C2.2 — Class centroids from master latent W
+// Output: centroids[C × d] in fp32
+// =============================================================================
+static void compute_class_centroids(const MasterLatent& master,
+                                    int V, int d,
+                                    fp32* centroids) // [N_CLASSES × d]
+{
+    std::vector<int> counts(N_CLASSES, 0);
+    std::fill(centroids, centroids + N_CLASSES * d, 0.0f);
+
+    std::vector<fp32> row(d);
+    for (int t = 0; t < V; ++t) {
+        int c = static_cast<int>(classify_byte(t));
+        master.get_row_fp32(t, row.data());
+        fp32* cent = centroids + static_cast<ptrdiff_t>(c) * d;
+        for (int j = 0; j < d; ++j) cent[j] += row[j];
+        counts[c]++;
+    }
+    for (int c = 0; c < N_CLASSES; ++c) {
+        if (counts[c] == 0) continue;
+        fp32* cent = centroids + static_cast<ptrdiff_t>(c) * d;
+        fp32 inv = 1.0f / static_cast<fp32>(counts[c]);
+        for (int j = 0; j < d; ++j) cent[j] *= inv;
+    }
+}
+
+// =============================================================================
+// C2.3 — Supervised InfoNCE semantic contrastive loss
+// L_semantic = -Σ_c Σ_{i∈S_c} log[ exp(cos(W_i, μ_c)/τ) / Σ_j exp(cos(W_i, W_j)/τ) ]
+// Approximation: denominator uses full V tokens (exact for V=256)
+// =============================================================================
+static fp32 compute_L_semantic(const MasterLatent& master,
+                                const fp32* centroids, // [N_CLASSES × d]
+                                int V, int d,
+                                fp32 tau = 0.05f)
+{
+    std::vector<fp32> wi(d), wj(d);
+    double total_loss = 0.0;
+
+    // Precompute all embeddings for denominator (O(V²) — fine for V=256)
+    std::vector<fp32> all_w(static_cast<size_t>(V) * d);
+    for (int t = 0; t < V; ++t) master.get_row_fp32(t, all_w.data() + (ptrdiff_t)t*d);
+
+    for (int i = 0; i < V; ++i) {
+        const fp32* wi_ptr = all_w.data() + static_cast<ptrdiff_t>(i) * d;
+        int ci = static_cast<int>(classify_byte(i));
+        const fp32* mu_c = centroids + static_cast<ptrdiff_t>(ci) * d;
+
+        // Cosine similarity Wi·μ_c
+        fp32 dot_ic = 0.0f, ni = 0.0f, nc = 0.0f;
+        for (int j = 0; j < d; ++j) {
+            dot_ic += wi_ptr[j] * mu_c[j];
+            ni     += wi_ptr[j] * wi_ptr[j];
+            nc     += mu_c[j]   * mu_c[j];
+        }
+        fp32 denom_ic = std::sqrt(ni) * std::sqrt(nc);
+        fp32 cos_ic   = (denom_ic > 1e-10f) ? dot_ic / denom_ic : 0.0f;
+        fp32 num_val  = cos_ic / tau;
+
+        // Denominator: Σ_j exp(cos(Wi, Wj) / τ)
+        double log_denom = 0.0;
+        {
+            // Compute max for stable log-sum-exp
+            fp32 mx = -1e30f;
+            std::vector<fp32> sims(V);
+            for (int jj = 0; jj < V; ++jj) {
+                if (jj == i) { sims[jj] = 0.0f; continue; }
+                const fp32* wj_ptr = all_w.data() + static_cast<ptrdiff_t>(jj) * d;
+                fp32 dot_ij = 0.0f, nj2 = 0.0f;
+                for (int k = 0; k < d; ++k) {
+                    dot_ij += wi_ptr[k] * wj_ptr[k];
+                    nj2    += wj_ptr[k] * wj_ptr[k];
+                }
+                fp32 dij = std::sqrt(ni) * std::sqrt(nj2);
+                sims[jj] = (dij > 1e-10f) ? (dot_ij / dij) / tau : 0.0f;
+                mx = std::max(mx, sims[jj]);
+            }
+            double sum_e = 0.0;
+            for (int jj = 0; jj < V; ++jj)
+                if (jj != i) sum_e += std::exp(static_cast<double>(sims[jj] - mx));
+            log_denom = static_cast<double>(mx) + std::log(sum_e + 1e-40);
+        }
+
+        total_loss += static_cast<double>(log_denom) - static_cast<double>(num_val);
+    }
+
+    return static_cast<fp32>(total_loss / V);
+}
+
+// =============================================================================
+// C2.4 — Orthogonality regularizer: L_ortho = ‖B^T·B - I_r‖_F²
+// =============================================================================
+static fp32 compute_L_ortho(const fp16* Basis, int d, int r) {
+    // Compute G = B^T·B  (r×r)
+    std::vector<fp32> G(static_cast<size_t>(r) * r, 0.0f);
+    for (int k1 = 0; k1 < r; ++k1) {
+        const fp16* bk1 = Basis + static_cast<ptrdiff_t>(k1) * d;
+        for (int k2 = k1; k2 < r; ++k2) {
+            const fp16* bk2 = Basis + static_cast<ptrdiff_t>(k2) * d;
+            fp32 dot = 0.0f;
+            for (int j = 0; j < d; ++j)
+                dot += bf16_to_f32(bk1[j]) * bf16_to_f32(bk2[j]);
+            G[static_cast<ptrdiff_t>(k1)*r + k2] = dot;
+            G[static_cast<ptrdiff_t>(k2)*r + k1] = dot; // symmetric
+        }
+    }
+    // L_ortho = ‖G - I_r‖_F²
+    fp32 loss = 0.0f;
+    for (int k1 = 0; k1 < r; ++k1)
+        for (int k2 = 0; k2 < r; ++k2) {
+            fp32 diff = G[static_cast<ptrdiff_t>(k1)*r+k2] - (k1 == k2 ? 1.0f : 0.0f);
+            loss += diff * diff;
+        }
+    return loss;
+}
+
+// =============================================================================
+// C2.5 — Hot-cold alignment loss: L_align = ‖μ_hot - μ_cold‖²
+// =============================================================================
+static fp32 compute_L_align(const MasterLatent& master,
+                             const std::vector<int>& hot_ids,
+                             int V, int d)
+{
+    int K = static_cast<int>(hot_ids.size());
+    int Vc = V - K;
+    if (K == 0 || Vc == 0) return 0.0f;
+
+    std::vector<bool> is_hot(V, false);
+    for (int id : hot_ids) if (id >= 0 && id < V) is_hot[id] = true;
+
+    std::vector<fp32> mu_hot(d, 0.0f), mu_cold(d, 0.0f);
+    std::vector<fp32> row(d);
+
+    int cnt_h = 0, cnt_c = 0;
+    for (int t = 0; t < V; ++t) {
+        master.get_row_fp32(t, row.data());
+        if (is_hot[t]) {
+            for (int j = 0; j < d; ++j) mu_hot[j] += row[j];
+            ++cnt_h;
+        } else {
+            for (int j = 0; j < d; ++j) mu_cold[j] += row[j];
+            ++cnt_c;
+        }
+    }
+    if (cnt_h > 0) for (fp32& v : mu_hot) v /= static_cast<fp32>(cnt_h);
+    if (cnt_c > 0) for (fp32& v : mu_cold) v /= static_cast<fp32>(cnt_c);
+
+    fp32 loss = 0.0f;
+    for (int j = 0; j < d; ++j) {
+        fp32 diff = mu_hot[j] - mu_cold[j];
+        loss += diff * diff;
+    }
+    return loss;
+}
+
+// =============================================================================
+// C2.6 — Quantization-friendly regularizer: L_quant
+// Penalizes clipping: L_quant = Σ_{i,b} Σ_j max(0, |W_{i,j}| - 127·s_{i,b})²
+// where s_{i,b} = max_block(|W_i|) / 127
+// =============================================================================
+static fp32 compute_L_quant(const MasterLatent& master, int V, int d, int B_blk) {
+    fp32 loss = 0.0f;
+    std::vector<fp32> row(d);
+    int m = (d + B_blk - 1) / B_blk;
+
+    for (int t = 0; t < V; ++t) {
+        master.get_row_fp32(t, row.data());
+        for (int b = 0; b < m; ++b) {
+            int start = b * B_blk;
+            int end   = std::min(start + B_blk, d);
+            fp32 abs_max = 0.0f;
+            for (int j = start; j < end; ++j)
+                abs_max = std::max(abs_max, std::abs(row[j]));
+            fp32 s = (abs_max > 0.0f) ? abs_max / 127.0f : 1.0f;
+            for (int j = start; j < end; ++j) {
+                fp32 excess = std::abs(row[j]) - 127.0f * s;
+                if (excess > 0.0f) loss += excess * excess;
+            }
+        }
+    }
+    return loss;
+}
+
+// =============================================================================
+// C2.5.1 — Hot-cold alignment gradient: backward_align
+// ∂L_align/∂W_i = 2(μ_hot - μ_cold)/K if hot, else -2(μ_hot - μ_cold)/(V-K)
+// =============================================================================
+static void backward_align(MasterLatent& master,
+                            const std::vector<int>& hot_ids,
+                            int V, int d, fp32 lambda2)
+{
+    if (lambda2 <= 0.0f) return;
+    int K = static_cast<int>(hot_ids.size());
+    int Vc = V - K;
+    if (K == 0 || Vc == 0) return;
+
+    std::vector<bool> is_hot(V, false);
+    for (int id : hot_ids) if (id >= 0 && id < V) is_hot[id] = true;
+
+    std::vector<fp32> mu_hot(d, 0.0f), mu_cold(d, 0.0f);
+    std::vector<fp32> row(d);
+
+    int cnt_h = 0, cnt_c = 0;
+    for (int t = 0; t < V; ++t) {
+        master.get_row_fp32(t, row.data());
+        if (is_hot[t]) {
+            for (int j = 0; j < d; ++j) mu_hot[j] += row[j];
+            ++cnt_h;
+        } else {
+            for (int j = 0; j < d; ++j) mu_cold[j] += row[j];
+            ++cnt_c;
+        }
+    }
+    if (cnt_h > 0) for (fp32& v : mu_hot) v /= static_cast<fp32>(cnt_h);
+    if (cnt_c > 0) for (fp32& v : mu_cold) v /= static_cast<fp32>(cnt_c);
+
+    std::vector<fp32> diff(d);
+    for (int j = 0; j < d; ++j) diff[j] = mu_hot[j] - mu_cold[j];
+
+    fp32 scale_h = 2.0f * lambda2 / static_cast<fp32>(K);
+    fp32 scale_c = -2.0f * lambda2 / static_cast<fp32>(Vc);
+
+    for (int t = 0; t < V; ++t) {
+        fp32* dw = master.row_dw(t);
+        fp32 s = is_hot[t] ? scale_h : scale_c;
+        for (int j = 0; j < d; ++j)
+            dw[j] += s * diff[j];
+    }
+}
+
+// =============================================================================
+// C2.6.1 — Quantization-friendly gradient: backward_quant
+// ∂L_quant/∂W_i,j = 2 · max(0, |W_i,j| - 127·s_i,b) · sgn(W_i,j)
+// =============================================================================
+static void backward_quant(MasterLatent& master, int V, int d, int B_blk, fp32 lambda4) {
+    if (lambda4 <= 0.0f) return;
+    std::vector<fp32> row(d);
+    int m = (d + B_blk - 1) / B_blk;
+
+    for (int t = 0; t < V; ++t) {
+        master.get_row_fp32(t, row.data());
+        fp32* dw = master.row_dw(t);
+        for (int b = 0; b < m; ++b) {
+            int start = b * B_blk;
+            int end   = std::min(start + B_blk, d);
+            fp32 abs_max = 0.0f;
+            for (int j = start; j < end; ++j)
+                abs_max = std::max(abs_max, std::abs(row[j]));
+            fp32 s_limit = abs_max; // 127 * (abs_max / 127)
+
+            for (int j = start; j < end; ++j) {
+                fp32 val = row[j];
+                fp32 excess = std::abs(val) - s_limit;
+                if (excess > 0.0f) {
+                    fp32 sgn = (val > 0.0f) ? 1.0f : -1.0f;
+                    dw[j] += 2.0f * lambda4 * excess * sgn;
+                }
+            }
+        }
+    }
+}
+
+// =============================================================================
+// C2.7 — Semantic loss gradient: backward_semantic
+// Accumulates InfoNCE gradient w.r.t. dW_master (simplified, temperature-scaled)
+// grad_W_i += λ1 · (p_pos_i - indicator + weighted_pull_toward_centroid)
+// Approximation: use centroid-pull simplified gradient for efficiency.
+// =============================================================================
+static void backward_semantic(MasterLatent& master,
+                               const fp32* centroids, // [N_CLASSES × d]
+                               int V, int d,
+                               fp32 tau, fp32 lambda1)
+{
+    if (lambda1 <= 0.0f) return;
+    std::vector<fp32> row(d);
+    fp32 scale = lambda1 / (tau * static_cast<fp32>(V));
+
+    for (int t = 0; t < V; ++t) {
+        int c = static_cast<int>(classify_byte(t));
+        const fp32* mu_c = centroids + static_cast<ptrdiff_t>(c) * d;
+        master.get_row_fp32(t, row.data());
+
+        // Simplified gradient: push W_t toward μ_c
+        // ∂L_semantic/∂W_t ≈ -scale · (μ_c - W_t)  (push toward centroid)
+        fp32* dw = master.row_dw(t);
+        for (int j = 0; j < d; ++j)
+            dw[j] += scale * (row[j] - mu_c[j]); // gradient descend pulls toward μ_c
+    }
+}
+
+// =============================================================================
+// C2.8 — Orthogonality gradient: backward_ortho
+// ∂L_ortho/∂B = 4 · B · (B^T·B - I_r)
+// Applied to dBasis (fp32 scratch), then written back before COMPRESS
+// =============================================================================
+static void backward_ortho(const fp16* Basis, fp32* dBasis, int d, int r, fp32 lambda3) {
+    if (lambda3 <= 0.0f) return;
+
+    // G = B^T·B  (r×r)
+    std::vector<fp32> G(static_cast<size_t>(r) * r, 0.0f);
+    for (int k1 = 0; k1 < r; ++k1) {
+        const fp16* bk1 = Basis + static_cast<ptrdiff_t>(k1) * d;
+        for (int k2 = k1; k2 < r; ++k2) {
+            const fp16* bk2 = Basis + static_cast<ptrdiff_t>(k2) * d;
+            fp32 dot = 0.0f;
+            for (int jj = 0; jj < d; ++jj)
+                dot += bf16_to_f32(bk1[jj]) * bf16_to_f32(bk2[jj]);
+            G[static_cast<ptrdiff_t>(k1)*r+k2] = dot;
+            G[static_cast<ptrdiff_t>(k2)*r+k1] = dot;
+        }
+    }
+
+    // (B^T·B - I_r)
+    for (int k = 0; k < r; ++k)
+        G[static_cast<ptrdiff_t>(k)*r+k] -= 1.0f;
+
+    // ∂L/∂B[:,k] = 4 · λ3 · Σ_{k2} B[:,k2] · G[k2,k]
+    fp32 coeff = 4.0f * lambda3;
+    for (int k1 = 0; k1 < r; ++k1) {
+        fp32* dbk1 = dBasis + static_cast<ptrdiff_t>(k1) * d;
+        for (int k2 = 0; k2 < r; ++k2) {
+            fp32 g = G[static_cast<ptrdiff_t>(k2)*r+k1] * coeff;
+            if (std::abs(g) < 1e-12f) continue;
+            const fp16* bk2 = Basis + static_cast<ptrdiff_t>(k2) * d;
+            for (int jj = 0; jj < d; ++jj)
+                dbk1[jj] += g * bf16_to_f32(bk2[jj]);
+        }
+    }
+}
+
+// =============================================================================
+// C1.3 / C1.6 — Stage 2 Backward + apply_gradients_s2
+// backward_s2: STE — dW_master[t] += dL_dX[i,:]  for every token
+//              NO writes to grad_Q / grad_A / grad_B (caches are non-trainable)
+// apply_gradients_s2: AdamW step on W_master, then call COMPRESS()
+// =============================================================================
+
+// Stage 2 backward: STE accumulation only — O(n·d)
+// Per-token gradient clipping (θ_clip=1.0) applied before accumulation.
+static void backward_s2(MasterLatent& master,
+                         const fp32* dL_dX, const int* T, int n,
+                         fp32 theta_clip = 1.0f)
+{
+    for (int i = 0; i < n; ++i) {
+        int t = T[i];
+        if (t < 0 || t >= master.V) continue;
+        const fp32* dxi = dL_dX + static_cast<ptrdiff_t>(i) * master.d;
+
+        // Per-token gradient norm for clipping
+        fp32 gnorm = 0.0f;
+        for (int j = 0; j < master.d; ++j) gnorm += dxi[j] * dxi[j];
+        gnorm = std::sqrt(gnorm);
+
+        // Clip factor: min(1, θ / ‖g_t‖)
+        fp32 clip = (gnorm > theta_clip && gnorm > 1e-8f)
+                    ? theta_clip / gnorm
+                    : 1.0f;
+
+        // Accumulate STE gradient
+        fp32* dw = master.row_dw(t);
+        for (int j = 0; j < master.d; ++j)
+            dw[j] += clip * dxi[j];
+    }
+}
+
+// AdamW optimizer state for master latent W[V×d]
+struct AdamWMasterState {
+    std::vector<fp32> m;   // first moment  [V×d]
+    std::vector<fp32> v;   // second moment [V×d]
+    int step = 0;
+
+    void init(int V, int d) {
+        size_t n = static_cast<size_t>(V) * d;
+        m.assign(n, 0.0f);
+        v.assign(n, 0.0f);
+    }
+
+    // Full AdamW step on W_master (all V tokens at once)
+    void update_all(MasterLatent& master,
+                    fp32 lr, fp32 beta1 = 0.9f, fp32 beta2 = 0.999f,
+                    fp32 eps = 1e-8f, fp32 weight_decay = 0.01f,
+                    // Tier-specific LR multipliers
+                    const std::vector<bool>* is_hot_set = nullptr,
+                    fp32 gamma_hot = 1.0f, fp32 gamma_cold = 2.0f)
+    {
+        ++step;
+        fp32 bc1  = 1.0f - std::pow(beta1, static_cast<fp32>(step));
+        fp32 bc2  = 1.0f - std::pow(beta2, static_cast<fp32>(step));
+        fp32 lr_t = lr * std::sqrt(bc2) / bc1;
+
+        int V = master.V, d = master.d;
+
+        for (int t = 0; t < V; ++t) {
+            // Tier-specific LR multiplier
+            fp32 gamma = 1.0f;
+            if (is_hot_set != nullptr)
+                gamma = (*is_hot_set)[t] ? gamma_hot : gamma_cold;
+
+            fp32* dw = master.row_dw(t);
+            fp16* w  = master.row_w(t);
+            fp32* mt = m.data() + static_cast<ptrdiff_t>(t) * d;
+            fp32* vt = v.data() + static_cast<ptrdiff_t>(t) * d;
+
+            for (int j = 0; j < d; ++j) {
+                fp32 g = dw[j];
+                mt[j] = beta1 * mt[j] + (1.0f - beta1) * g;
+                vt[j] = beta2 * vt[j] + (1.0f - beta2) * g * g;
+                // Expand bf16 → fp32, update, repack
+                fp32 wj = bf16_to_f32(w[j]);
+                // Decoupled weight decay
+                wj *= (1.0f - lr * weight_decay);
+                // Adam step
+                wj -= gamma * lr_t * mt[j] / (std::sqrt(vt[j]) + eps);
+                w[j] = f32_to_bf16(wj);
+            }
+        }
+    }
+
+    // Reset momentum for rows that changed tier (optional)
+    void reset_momentum(const std::vector<int>& migrated_rows, int d) {
+        for (int t : migrated_rows) {
+            fp32* mt = m.data() + static_cast<ptrdiff_t>(t) * d;
+            fp32* vt = v.data() + static_cast<ptrdiff_t>(t) * d;
+            std::fill(mt, mt + d, 0.0f);
+            std::fill(vt, vt + d, 0.0f);
+        }
+    }
+};
+
+// =============================================================================
+// Utility: compute hot/cold gradient norm ratio (for Gate G5 logging)
+// Returns {gnorm_hot, gnorm_cold}
+// =============================================================================
+static std::pair<fp32,fp32> compute_tier_grad_ratio(
+    const MasterLatent& master,
+    const std::vector<bool>& is_hot_set)
+{
+    double gnorm_hot2 = 0.0, gnorm_cold2 = 0.0;
+    int V = master.V, d = master.d;
+    for (int t = 0; t < V; ++t) {
+        const fp32* dw = master.row_dw(t);
+        double row_norm2 = 0.0;
+        for (int j = 0; j < d; ++j) row_norm2 += static_cast<double>(dw[j]) * dw[j];
+        if (is_hot_set[t]) gnorm_hot2  += row_norm2;
+        else               gnorm_cold2 += row_norm2;
+    }
+    return { static_cast<fp32>(std::sqrt(gnorm_hot2)),
+             static_cast<fp32>(std::sqrt(gnorm_cold2)) };
+}
+
+// =============================================================================
+
+
 class HFAQE {
 public:
     HFAQEConfig cfg;
     HotTier  hot;
     ColdTier cold;
 
-    // Gradient accumulators (fp32, allocated during first backward)
-    std::vector<fp32> grad_Q;    // [K × d]   straight-through for hot
-    std::vector<fp32> grad_S;    // [K × m]
-    std::vector<fp32> grad_A;    // [(V-K) × r]  sparse, zero between steps
-    std::vector<fp32> grad_B;    // [d × r]   dense, col-major
+    // Integrated Training State
+    bool training_enabled = false;
+    MasterLatent master;
+    AdamWMasterState adam_W;
+    TierAllocator tier_alloc;
+    std::vector<bool> is_hot_set;
+    std::vector<int> current_hot_ids;
+    int global_step = 0;
+    int migration_count = 0;
 
-    // Tracks which cold rows have been touched (for sparse grad check)
-    std::unordered_set<int> touched_cold_slots;
+    // Caching token frequencies for dynamic tier reallocation
+    std::vector<fp32> token_frequencies;
+
+    // Training Hyperparameters (Default values matching SPEC)
+    fp32 s2_beta = 0.3f;
+    int s2_T_realloc = 300;
+    int s2_T_ortho = 100;
+    fp32 s2_theta_clip = 1.0f;
+    fp32 s2_tau = 0.05f;
+    fp32 s2_lambda_semantic = 0.1f;
+    fp32 s2_lambda_align = 0.01f;
+    fp32 s2_lambda_ortho = 0.001f;
+    fp32 s2_lambda_quant = 0.001f;
+    fp32 s2_gamma_hot = 1.0f;
+    fp32 s2_gamma_cold = 2.0f;
+    fp32 s2_gamma_basis = 0.5f;
 
     explicit HFAQE(const HFAQEConfig& config) : cfg(config) {}
+
+    // Deprecated flag support (for compatibility)
+    bool stage2_enabled = true; 
+
+    void setup_training(fp32 beta = 0.3f, int T_realloc = 300, int T_ortho = 100) {
+        training_enabled = true;
+        s2_beta = beta;
+        s2_T_realloc = T_realloc;
+        s2_T_ortho = T_ortho;
+
+        init_master_from_hfaqe(master, *this);
+        adam_W.init(cfg.V, cfg.d);
+        tier_alloc.init(cfg.V, T_realloc, beta);
+
+        is_hot_set.assign(cfg.V, false);
+        for (int slot = 0; slot < hot.K; ++slot) {
+            int gid = hot.global_ids[slot];
+            if (gid >= 0 && gid < cfg.V) is_hot_set[gid] = true;
+        }
+        current_hot_ids.assign(hot.global_ids.begin(), hot.global_ids.end());
+
+        global_step = 0;
+        migration_count = 0;
+    }
+
+    // Compatibility method
+    void enable_stage2(fp32 beta = 0.3f, int T_realloc = 300, int T_ortho = 100) {
+        setup_training(beta, T_realloc, T_ortho);
+    }
 
     // -----------------------------------------------------------------
     // build_frequency_tiers
@@ -597,6 +1303,7 @@ public:
     // Selects top-K by frequency as hot tier (§1.3 Zipf justification).
     // -----------------------------------------------------------------
     void build_frequency_tiers(const std::vector<fp32>& token_freq) {
+        token_frequencies = token_freq;
         if ((int)token_freq.size() != cfg.V)
             throw std::invalid_argument("token_freq size != V");
 
@@ -679,14 +1386,6 @@ public:
             for (int j = 0; j < cfg.d; ++j)
                 basis_k[j] = f32_to_bf16(sqrt_sk * Vt[static_cast<ptrdiff_t>(k)*cfg.d + j]);
         }
-
-        // Step 4: Discard E_C (goes out of scope automatically)
-
-        // Allocate gradient buffers
-        grad_Q.assign(static_cast<size_t>(cfg.K) * cfg.d, 0.0f);
-        grad_S.assign(static_cast<size_t>(cfg.K) * cfg.m(), 0.0f);
-        grad_A.assign(static_cast<size_t>(cold.Vc) * cfg.r, 0.0f);
-        grad_B.assign(static_cast<size_t>(cfg.d) * cfg.r, 0.0f);
     }
 
     // =================================================================
@@ -734,76 +1433,35 @@ public:
 
 
     // =================================================================
-    // §2.3 — Backward Pass: Algorithm 2 HFAQE Backward (Training)
+    // §2.3 — Backward Pass: Integrated STE Backward
     // Input:  dL_dX ∈ fp32[n×d],  T ∈ int[n]
-    // Accumulates: grad_Q, grad_S  (hot sparse scatter-add)
-    //              grad_A (cold sparse), grad_B (cold dense outer-product)
     // Key property: No O(V×d) dense gradient instantiated.
     // =================================================================
-    void backward(const fp32* dL_dX, const int* T, int n) {
-        // Guard: gradient explosion check (SPEC §5.4)
-        // Computed post-accumulation in zero_grad_check()
+    void backward(const fp32* dL_dX, const int* T, int n, fp32 theta_clip = 1.0f) {
+        if (!training_enabled) return;
 
         for (int i = 0; i < n; ++i) {
             int t = T[i];
-            if (t < 0 || t >= cfg.V)
-                throw std::out_of_range("HFAQE backward: token ID out of range");
-
+            if (t < 0 || t >= cfg.V) continue;
             const fp32* dxi = dL_dX + static_cast<ptrdiff_t>(i) * cfg.d;
 
-            auto hot_it = hot.idx.find(t);
-            if (hot_it != hot.idx.end()) {
-                // ---- Hot path: straight-through estimator (STE) ----------
-                // grad_q = s · ∂L/∂X[i,j]
-                // grad_s = Q_H[slot,j] · ∂L/∂X[i,j]    (summed over block)
-                int slot = hot_it->second;
-                const int8* qrow = hot.row_q(slot);
-                const fp32* srow = hot.row_s(slot);
-                fp32*    gqrow = grad_Q.data() + static_cast<ptrdiff_t>(slot)*cfg.d;
-                fp32*    gsrow = grad_S.data() + static_cast<ptrdiff_t>(slot)*cfg.m();
+            // Per-token gradient norm for clipping
+            fp32 gnorm = 0.0f;
+            for (int j = 0; j < cfg.d; ++j) gnorm += dxi[j] * dxi[j];
+            gnorm = std::sqrt(gnorm);
 
-                int m = cfg.m();
-                for (int b = 0; b < m; ++b) {
-                    int start = b * cfg.B;
-                    int end   = std::min(start + cfg.B, cfg.d);
-                    fp32 s = srow[b];
-                    fp32 gs_acc = 0.0f;
-                    for (int j = start; j < end; ++j) {
-                        fp32 dlx = dxi[j];
-                        gqrow[j] += s * dlx;                             // ∂L/∂q
-                        gs_acc   += static_cast<fp32>(qrow[j]) * dlx;   // ∂L/∂s
-                    }
-                    gsrow[b] += gs_acc;
-                }
-            } else {
-                // ---- Cold path: low-rank gradient factorization ----------
-                auto cold_it = cold.idx.find(t);
-                if (cold_it == cold.idx.end())
-                    throw std::out_of_range("HFAQE backward: token not in any tier");
-                int cslot = cold_it->second;
-                touched_cold_slots.insert(cslot);
+            // Clip factor
+            fp32 clip = (gnorm > theta_clip && gnorm > 1e-8f)
+                        ? theta_clip / gnorm
+                        : 1.0f;
 
-                const fp16* alpha = cold.row_a(cslot);
-                fp32* ga_row = grad_A.data() + static_cast<ptrdiff_t>(cslot)*cfg.r;
-                fp32* gB     = grad_B.data(); // d×r col-major
+            // Accumulate STE gradient
+            fp32* dw = master.row_dw(t);
+            for (int j = 0; j < cfg.d; ++j)
+                dw[j] += clip * dxi[j];
 
-                // ∂L/∂α_k = Σ_j Basis[k*d+j] · ∂L/∂X[i,j]   O(d·r)
-                for (int k = 0; k < cfg.r; ++k) {
-                    const fp16* bk = cold.basis_col(k);
-                    fp32 acc = 0.0f;
-                    for (int j = 0; j < cfg.d; ++j)
-                        acc += bf16_to_f32(bk[j]) * dxi[j];
-                    ga_row[k] += acc;
-                }
-
-                // ∂L/∂B[j,k] += ∂L/∂X[i,j] · α_k   (outer product) O(d·r)
-                for (int k = 0; k < cfg.r; ++k) {
-                    fp32 ak = bf16_to_f32(alpha[k]);
-                    fp32* gB_col_k = gB + static_cast<ptrdiff_t>(k)*cfg.d;
-                    for (int j = 0; j < cfg.d; ++j)
-                        gB_col_k[j] += dxi[j] * ak;
-                }
-            }
+            // Record gradient norm for TierAllocator
+            tier_alloc.record_grad_norm(t, gnorm);
         }
     }
 
@@ -872,27 +1530,16 @@ public:
     // Gradient utilities
     // =================================================================
     void zero_grad() {
-        std::fill(grad_Q.begin(), grad_Q.end(), 0.0f);
-        std::fill(grad_S.begin(), grad_S.end(), 0.0f);
-        std::fill(grad_A.begin(), grad_A.end(), 0.0f);
-        std::fill(grad_B.begin(), grad_B.end(), 0.0f);
-        touched_cold_slots.clear();
+        if (training_enabled) master.zero_grad_master();
     }
 
     // SPEC §5.4: gradient explosion guard
-    // Returns true if ‖∂L/∂B‖_F ≤ 10·‖∂L/∂X‖_F
+    // Returns true if ‖dW_master‖_F is within reasonable bounds
     bool check_grad_magnitude(fp32 dL_dX_frob) const {
-        fp32 gB_frob = 0.0f;
-        for (fp32 v : grad_B) gB_frob += v*v;
-        gB_frob = std::sqrt(gB_frob);
-        return gB_frob <= 10.0f * dL_dX_frob;
+        if (!training_enabled) return true;
+        fp32 gW_frob = master.grad_norm_master();
+        return gW_frob <= 10.0f * dL_dX_frob;
     }
-
-    // Number of non-zero rows in ∂L/∂A (SPEC §5.3 gradient sparsity test)
-    int nnz_grad_A_rows() const {
-        return static_cast<int>(touched_cold_slots.size());
-    }
-
 
     // =================================================================
     // §3.3 — Memory-Mapped Tiered Paging (mmap cold coefficients)
@@ -930,14 +1577,76 @@ public:
         cold.A_mmap_ptr = ptr;
         cold.A_mmap_sz  = sz;
         cold.A_mmap_fd  = fd;
-        // Remap cold.A vector data pointer (zero-copy: cast and assign)
-        // We alias the raw pointer — use with care (read-only mmap)
-        // For writeable training, fall back to the vector allocation.
         return true;
 #else
         (void)filepath;
         return false; // Windows: use VirtualAlloc approach if needed
 #endif
+    }
+
+    // =================================================================
+    // §7 — ARC: Dynamic vocabulary expansion
+    // Adds a new cold token at runtime by learning only an r-dimensional
+    // coefficient vector (no hot-tier or basis modification required).
+    // =================================================================
+    void add_cold_token(int new_id, const fp32* init_vec = nullptr) {
+        // 1. Grow vocabulary config
+        int new_V = std::max(cfg.V, new_id + 1);
+        int d = cfg.d;
+        int r = cfg.r;
+
+        // 2. Allocate and initialize coefficient row α ∈ ℝ^r
+        std::vector<fp16> alpha(r, fp16(0));
+        if (init_vec != nullptr) {
+            // Project init_vec onto basis B: α_k = Σ_j B[j,k] · init_vec[j]
+            for (int k = 0; k < r; ++k) {
+                const fp16* bk = cold.basis_col(k);
+                fp32 dot = 0.0f;
+                for (int j = 0; j < d; ++j)
+                    dot += bf16_to_f32(bk[j]) * init_vec[j];
+                alpha[k] = f32_to_bf16(dot);
+            }
+        }
+
+        // 3. Append to cold tier caches
+        int new_cslot = cold.Vc;
+        cold.Vc += 1;
+        cold.global_ids.push_back(new_id);
+        cold.idx[new_id] = new_cslot;
+        cold.A.insert(cold.A.end(), alpha.begin(), alpha.end());
+
+        // 4. Handle training state if enabled
+        if (training_enabled) {
+            // Grow MasterLatent
+            master.V = new_V;
+            master.W.resize(static_cast<size_t>(new_V) * d, 0);
+            master.dW.resize(static_cast<size_t>(new_V) * d, 0.0f);
+
+            // Initialize new row in W
+            if (init_vec != nullptr) {
+                master.set_row_fp32(new_id, init_vec);
+            } else {
+                // If no init_vec, reconstruct from the projected alpha (which is zero if no init_vec)
+                std::vector<fp32> recon(d, 0.0f);
+                cold_reconstruct(cold.Basis.data(), alpha.data(), d, r, recon.data());
+                master.set_row_fp32(new_id, recon.data());
+            }
+
+            // Grow AdamW states
+            size_t old_sz = adam_W.m.size();
+            size_t new_sz = static_cast<size_t>(new_V) * d;
+            if (new_sz > old_sz) {
+                adam_W.m.resize(new_sz, 0.0f);
+                adam_W.v.resize(new_sz, 0.0f);
+            }
+
+            // Grow helper sets
+            is_hot_set.resize(new_V, false);
+            if ((int)token_frequencies.size() < new_V)
+                token_frequencies.resize(new_V, 0.0f);
+        }
+
+        cfg.V = new_V;
     }
 
     ~HFAQE() {
@@ -950,50 +1659,186 @@ public:
     }
 
     // =================================================================
-    // §2.5 — Apply gradients (SGD step, learning rate lr)
-    // Hot: requantize after fp32 parameter update
-    // Cold A: update bf16 coefficients from fp32 grads (sparse)
-    // Cold B: update bf16 basis from fp32 grads (dense)
+    // Integrated Apply Gradients: Standard Flow
+    // 1. Semantic, Align, Ortho, and Quant gradients
+    // 2. AdamW update on MasterLatent
+    // 3. Periodic Reallocation and QR
+    // 4. Compress to tiered caches
     // =================================================================
     void apply_gradients(fp32 lr) {
-        // Hot tier gradient apply: dequant → subtract grad → requantize
-        std::vector<fp32> row_fp32(cfg.d);
-        for (int slot = 0; slot < cfg.K; ++slot) {
-            fp32* gq = grad_Q.data() + static_cast<ptrdiff_t>(slot)*cfg.d;
-            fp32* gs = grad_S.data() + static_cast<ptrdiff_t>(slot)*cfg.m();
-            // Dequantize current weights
-            dequant_row(hot.row_q(slot), hot.row_s(slot),
-                        cfg.d, cfg.B, row_fp32.data());
-            // Gradient descent on fp32 representation
-            for (int j = 0; j < cfg.d; ++j)
-                row_fp32[j] -= lr * gq[j];
-            // Requantize back
-            quantize_row(row_fp32.data(), cfg.d, cfg.B,
-                         hot.row_q(slot), hot.row_s(slot));
-        }
+        if (!training_enabled) return;
 
-        // Cold A: sparse update only touched rows
-        for (int cslot : touched_cold_slots) {
-            fp16* arow = cold.row_a(cslot);
-            fp32* garow = grad_A.data() + static_cast<ptrdiff_t>(cslot)*cfg.r;
+        // 1. Auxiliary gradients
+        std::vector<fp32> centroids(N_CLASSES * cfg.d);
+        compute_class_centroids(master, cfg.V, cfg.d, centroids.data());
+        backward_semantic(master, centroids.data(), cfg.V, cfg.d, s2_tau, s2_lambda_semantic);
+        backward_align(master, current_hot_ids, cfg.V, cfg.d, s2_lambda_align);
+        backward_quant(master, cfg.V, cfg.d, cfg.B, s2_lambda_quant);
+
+        // 2. Ortho gradient step on B
+        {
+            std::vector<fp32> dBasis(static_cast<size_t>(cfg.d) * cfg.r, 0.0f);
+            backward_ortho(cold.Basis.data(), dBasis.data(), cfg.d, cfg.r, s2_lambda_ortho);
+            fp32 basis_lr = lr * s2_gamma_basis;
             for (int k = 0; k < cfg.r; ++k) {
-                fp32 updated = bf16_to_f32(arow[k]) - lr * garow[k];
-                arow[k] = f32_to_bf16(updated);
+                fp16* bk = cold.basis_col(k);
+                fp32* dbk = dBasis.data() + static_cast<ptrdiff_t>(k) * cfg.d;
+                for (int j = 0; j < cfg.d; ++j) {
+                    fp32 updated = bf16_to_f32(bk[j]) - basis_lr * dbk[j];
+                    bk[j] = f32_to_bf16(updated);
+                }
             }
         }
 
-        // Cold Basis: dense update (col-major d×r)
-        for (int k = 0; k < cfg.r; ++k) {
-            fp16* bk = cold.basis_col(k);
-            fp32* gbk = grad_B.data() + static_cast<ptrdiff_t>(k)*cfg.d;
-            for (int j = 0; j < cfg.d; ++j) {
-                fp32 updated = bf16_to_f32(bk[j]) - lr * gbk[j];
-                bk[j] = f32_to_bf16(updated);
-            }
+        // 3. AdamW step on W_master
+        adam_W.update_all(master, lr, 0.9f, 0.999f, 1e-8f, 0.01f, &is_hot_set, s2_gamma_hot, s2_gamma_cold);
+
+        // 4. Periodic QR re-orthogonalization
+        if (global_step > 0 && global_step % s2_T_ortho == 0) {
+            gram_schmidt_qr(cold.Basis.data(), cfg.d, cfg.r);
         }
+
+        // 5. Periodic tier reallocation
+        if (global_step > 0 && global_step % s2_T_realloc == 0) {
+            auto old_hot = current_hot_ids;
+            current_hot_ids = tier_alloc.reallocate(token_frequencies, cfg.K);
+
+            std::unordered_set<int> old_set(old_hot.begin(), old_hot.end());
+            for (int id : current_hot_ids)
+                if (old_set.find(id) == old_set.end()) ++migration_count;
+
+            std::fill(is_hot_set.begin(), is_hot_set.end(), false);
+            for (int id : current_hot_ids)
+                if (id >= 0 && id < cfg.V) is_hot_set[id] = true;
+
+            std::vector<int> migrated;
+            for (int id : current_hot_ids)
+                if (old_set.find(id) == old_set.end()) migrated.push_back(id);
+            if (!migrated.empty()) adam_W.reset_momentum(migrated, cfg.d);
+        }
+
+        // 6. Compress master to caches
+        compress_master(*this, master, current_hot_ids);
+
+        ++global_step;
+        master.zero_grad_master();
     }
 
 }; // end class HFAQE
+
+// C1.5 — COMPRESS: W_master → {Q_H, S_H, A, Basis}
+// Called after each optimizer step (or every T_realloc steps).
+// Accepts new hot_ids (from TierAllocator::reallocate) or derives from
+// existing tier assignment.  Performs:
+//   1. Quantize hot rows from W into (Q_H, S_H)
+//   2. Hard QR re-orthonormalise Basis
+//   3. Project cold rows: A[cslot] = B^T · W[i]  (orthogonal projection)
+// Complexity: O(K·d + d·r² + Vc·d·r)  — called rarely (every 300 steps)
+// =============================================================================
+static void compress_master(HFAQE& model, const MasterLatent& master,
+                             const std::vector<int>& new_hot_ids)
+{
+    int V = model.cfg.V;
+    int K = model.cfg.K;
+    int d = model.cfg.d;
+    int r = model.cfg.r;
+    int B = model.cfg.B;
+
+    // ---- 1. Rebuild tier index maps from new hot set -----------------------
+    // Build new hot/cold global_ids and lookup maps
+    std::vector<bool> is_hot(V, false);
+    for (int id : new_hot_ids) {
+        if (id >= 0 && id < V) is_hot[id] = true;
+    }
+
+    // Rebuild hot tier
+    model.hot.global_ids.resize(K, -1);
+    model.hot.idx.clear();
+    int slot = 0;
+    for (int id : new_hot_ids) {
+        if (slot >= K) break;
+        model.hot.global_ids[slot] = id;
+        model.hot.idx[id] = slot;
+        ++slot;
+    }
+
+    // Rebuild cold tier
+    model.cold.global_ids.clear();
+    model.cold.idx.clear();
+    int cslot = 0;
+    for (int t = 0; t < V; ++t) {
+        if (!is_hot[t]) {
+            model.cold.global_ids.push_back(t);
+            model.cold.idx[t] = cslot++;
+        }
+    }
+
+    // ---- 2. QR re-orthonormalise Basis B  (Hard reset every T_ortho) ------
+    gram_schmidt_qr(model.cold.Basis.data(), d, r);
+
+    // ---- 3. Quantize hot rows: W[i] → (Q_H[slot], S_H[slot]) -------------
+    std::vector<fp32> row_fp32(d);
+    for (int hslot = 0; hslot < K; ++hslot) {
+        int gid = model.hot.global_ids[hslot];
+        if (gid < 0 || gid >= V) continue;
+        master.get_row_fp32(gid, row_fp32.data());
+        quantize_row(row_fp32.data(), d, B,
+                     model.hot.row_q(hslot), model.hot.row_s(hslot));
+    }
+
+    // ---- 4. Project cold rows: a_i = B^T · W[i]  (O(d·r) per cold token) -
+    int Vc = model.cold.Vc;
+    for (int cs = 0; cs < Vc; ++cs) {
+        int gid = model.cold.global_ids[cs];
+        if (gid < 0 || gid >= V) continue;
+        master.get_row_fp32(gid, row_fp32.data());
+
+        // a_k = Σ_j B[j,k] · W[gid,j]   (B column-major: basis_col(k)[j])
+        fp16* a_row = model.cold.row_a(cs);
+        for (int k = 0; k < r; ++k) {
+            const fp16* bk = model.cold.basis_col(k);
+            fp32 dot = 0.0f;
+            for (int j = 0; j < d; ++j)
+                dot += bf16_to_f32(bk[j]) * row_fp32[j];
+            a_row[k] = f32_to_bf16(dot);
+        }
+    }
+}
+
+// =============================================================================
+
+
+// Utility: Initialize MasterLatent from existing HFAQE tiered caches
+// Used when loading a Stage-1 checkpoint and upgrading to Stage-2 training.
+// Dequantizes hot rows, reconstructs cold rows into W_master.
+// =============================================================================
+static void init_master_from_hfaqe(MasterLatent& master, const HFAQE& model) {
+    int V = model.cfg.V;
+    int d = model.cfg.d;
+    master.allocate(V, d);
+
+    std::vector<fp32> row(d);
+
+    // Hot rows: dequantize int8 → fp32 → store as bf16 in W
+    for (int slot = 0; slot < model.hot.K; ++slot) {
+        int gid = model.hot.global_ids[slot];
+        if (gid < 0 || gid >= V) continue;
+        dequant_row(model.hot.row_q(slot), model.hot.row_s(slot),
+                    d, model.cfg.B, row.data());
+        master.set_row_fp32(gid, row.data());
+    }
+
+    // Cold rows: B·α reconstruct → store as bf16 in W
+    for (int cs = 0; cs < model.cold.Vc; ++cs) {
+        int gid = model.cold.global_ids[cs];
+        if (gid < 0 || gid >= V) continue;
+        cold_reconstruct(model.cold.Basis.data(), model.cold.row_a(cs),
+                         d, model.cfg.r, row.data());
+        master.set_row_fp32(gid, row.data());
+    }
+}
+// =============================================================================
+
 
 // =============================================================================
 // §1.3 — Zipf Utility: build uniform Zipf frequency distribution
@@ -1030,5 +1875,7 @@ struct MemoryBudget {
     }
 };
 
+// =============================================================================
+// ██████████████████████████████████████████████████████████████████████████████
 
 #endif // HFAQE_CORE_CPP

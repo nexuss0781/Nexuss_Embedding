@@ -1127,8 +1127,447 @@ int main(int argc, char** argv) {
     // §1.1 Mathematical guarantees
     test_corollary_1_2_rmse_bound();
 
+    // ── Stage 2 Tests ─────────────────────────────────────────────────────────
+    test_stage2_suite();
+
     std::printf("\n=============================================\n");
     std::printf("Results: %d PASSED, %d FAILED\n", g_pass, g_fail);
     return (g_fail == 0) ? 0 : 1;
 }
 
+// ████████████████████████████████████████████████████████████████████████████
+// STAGE 2 TEST SUITE  (S2.1 – S2.8)
+// All tests are embedding-layer–only; no LM head, no perplexity.
+// ████████████████████████████████████████████████████████████████████████████
+
+// =============================================================================
+// S2.1 — MasterLatent: allocate, zero_grad, accumulate_grad, get/set row
+// =============================================================================
+static void test_s2_master_latent_basics() {
+    print_section("S2.1 MasterLatent Basics");
+
+    MasterLatent M;
+    M.allocate(100, 32);
+
+    // Initial W should be all zero (fp16 0)
+    std::vector<fp32> row(32);
+    M.get_row_fp32(0, row.data());
+    bool all_zero = true;
+    for (fp32 v : row) if (std::abs(v) > 1e-6f) { all_zero = false; break; }
+    EXPECT_TRUE(all_zero, "S2.1 MasterLatent: W initialized to 0");
+
+    // set_row_fp32 / get_row_fp32 round-trip
+    std::vector<fp32> in(32);
+    for (int j = 0; j < 32; ++j) in[j] = static_cast<fp32>(j) * 0.01f;
+    M.set_row_fp32(5, in.data());
+    M.get_row_fp32(5, row.data());
+    bool roundtrip_ok = true;
+    for (int j = 0; j < 32; ++j) {
+        if (std::abs(row[j] - in[j]) > 1e-2f) { roundtrip_ok = false; break; }
+    }
+    EXPECT_TRUE(roundtrip_ok, "S2.1 MasterLatent: set/get row fp32 round-trip (bf16 tol)");
+
+    // zero_grad_master clears dW
+    M.dW[0] = 99.0f; M.dW[100] = -5.0f;
+    M.zero_grad_master();
+    bool dw_zero = true;
+    for (fp32 v : M.dW) if (v != 0.0f) { dw_zero = false; break; }
+    EXPECT_TRUE(dw_zero, "S2.1 MasterLatent: zero_grad_master clears dW");
+
+    // accumulate_grad adds to dW[t]
+    std::vector<fp32> g(32, 1.0f);
+    M.accumulate_grad(3, g.data());
+    bool accum_ok = true;
+    for (int j = 0; j < 32; ++j)
+        if (std::abs(M.dW[3*32+j] - 1.0f) > 1e-6f) { accum_ok = false; break; }
+    EXPECT_TRUE(accum_ok, "S2.1 MasterLatent: accumulate_grad adds to dW[t]");
+
+    // grad_norm_master is non-zero after accumulate
+    fp32 gn = M.grad_norm_master();
+    EXPECT_TRUE(gn > 0.0f, "S2.1 MasterLatent: grad_norm_master > 0 after accumulate");
+}
+
+// =============================================================================
+// S2.2 — backward_s2: STE gradient flow test
+// Verifies gnorm_master > 0 after one backward pass (fixes Stage-1 gnorm=0 bug)
+// =============================================================================
+static void test_s2_ste_gradient_flow() {
+    print_section("S2.2 STE Gradient Flow (fixes gnorm=0 bug)");
+
+    HFAQE model = make_test_model(256, 64, 16, 64, 64);
+    MasterLatent master;
+    init_master_from_hfaqe(master, model);
+    master.zero_grad_master();
+
+    // Create a non-zero gradient tensor dL_dX for 10 tokens
+    std::vector<int> T = {0, 1, 2, 10, 20, 50, 100, 150, 200, 255};
+    int n = (int)T.size();
+    std::vector<fp32> dX(static_cast<size_t>(n) * 64);
+    std::mt19937_64 rng(7777);
+    std::normal_distribution<fp32> nd(0.0f, 1.0f);
+    for (fp32& v : dX) v = nd(rng);
+
+    backward_s2(master, dX.data(), T.data(), n, 1.0f);
+
+    fp32 gnorm = master.grad_norm_master();
+    EXPECT_TRUE(gnorm > 1e-6f,
+        "S2.2 STE: ‖dW_master‖_F > 0 after backward (Stage-1 gnorm=0 bug fixed)");
+
+    if (g_verbose)
+        std::printf("     gnorm_master = %.6f  (expected > 0)\n", gnorm);
+
+    // Verify only touched token rows have non-zero grad
+    for (int t : T) {
+        fp32 rn = master.row_grad_norm(t);
+        EXPECT_TRUE(rn > 0.0f,
+            ("S2.2 STE: touched token " + std::to_string(t) + " has non-zero grad").c_str());
+    }
+
+    // Verify untouched tokens have zero grad
+    std::vector<int> untouched = {5, 30, 80, 130, 180};
+    for (int t : untouched) {
+        fp32 rn = master.row_grad_norm(t);
+        EXPECT_TRUE(rn == 0.0f,
+            ("S2.2 STE: untouched token " + std::to_string(t) + " has zero grad").c_str());
+    }
+
+    // Per-token clip: with theta_clip=0.01, very large grad should be clipped
+    master.zero_grad_master();
+    std::vector<fp32> big_dX(64, 100.0f);  // huge gradient
+    std::vector<int>  one_tok = {7};
+    backward_s2(master, big_dX.data(), one_tok.data(), 1, 0.01f);
+    fp32 clipped_rn = master.row_grad_norm(7);
+    EXPECT_TRUE(clipped_rn <= 0.02f,  // clip threshold 0.01 * sqrt(64)=0.08 ish
+        "S2.2 STE: per-token gradient clipping applied (large grad clamped)");
+}
+
+// =============================================================================
+// S2.3 — gram_schmidt_qr: orthonormality verification
+// After QR, ‖B^T·B - I_r‖_F < 1e-4
+// =============================================================================
+static void test_s2_gram_schmidt() {
+    print_section("S2.3 Gram-Schmidt QR Orthonormality");
+
+    // Build a random (non-orthogonal) basis
+    int d = 128, r = 16;
+    HFAQEConfig cfg; cfg.V=256; cfg.d=d; cfg.r=r; cfg.K=64; cfg.B=64;
+    HFAQE m(cfg);
+    auto freq = zipf_frequencies(256);
+    m.build_frequency_tiers(freq);
+    m.initialize_weights(42);
+
+    // Measure ortho error before QR
+    fp32 before = compute_L_ortho(m.cold.Basis.data(), d, r);
+
+    // Apply QR
+    gram_schmidt_qr(m.cold.Basis.data(), d, r);
+
+    // Measure after
+    fp32 after = compute_L_ortho(m.cold.Basis.data(), d, r);
+    double after_frob = std::sqrt(static_cast<double>(after));
+
+    if (g_verbose)
+        std::printf("     ‖B^TB-I‖_F before=%.6f  after=%.6f\n",
+                    std::sqrt(static_cast<double>(before)), after_frob);
+
+    EXPECT_TRUE(after_frob < 1e-3,
+        "S2.3 gram_schmidt_qr: ‖B^T·B - I_r‖_F < 1e-3 after QR");
+
+    // Double-apply should remain near identity
+    gram_schmidt_qr(m.cold.Basis.data(), d, r);
+    fp32 after2 = compute_L_ortho(m.cold.Basis.data(), d, r);
+    EXPECT_TRUE(std::sqrt(static_cast<double>(after2)) < 1e-3,
+        "S2.3 gram_schmidt_qr: idempotent — second pass stays near ortho");
+}
+
+// =============================================================================
+// S2.4 — compress_master: round-trip fidelity
+// After compress_master, the tiered forward should match W_master to within
+// the sum of quantization + reconstruction errors.
+// =============================================================================
+static void test_s2_compress_round_trip() {
+    print_section("S2.4 COMPRESS Round-Trip Fidelity");
+
+    HFAQEConfig cfg; cfg.V=256; cfg.d=64; cfg.r=16; cfg.K=64; cfg.B=64;
+    HFAQE model(cfg);
+    auto freq = zipf_frequencies(256);
+    model.build_frequency_tiers(freq);
+    model.initialize_weights(99);
+
+    // Build master from initialized caches
+    MasterLatent master;
+    init_master_from_hfaqe(master, model);
+
+    // Run COMPRESS with the current hot_ids
+    std::vector<int> hot_ids(model.hot.global_ids.begin(),
+                              model.hot.global_ids.end());
+    compress_master(model, master, hot_ids);
+
+    // After compress, tiered forward must match W_master within tolerance
+    std::vector<fp32> w_ref(cfg.d), w_fwd(cfg.d);
+    double max_rel_err = 0.0;
+
+    // Check a few hot tokens
+    for (int slot = 0; slot < std::min(5, model.hot.K); ++slot) {
+        int gid = model.hot.global_ids[slot];
+        master.get_row_fp32(gid, w_ref.data());
+        auto X = model.forward({gid});
+        double num = 0.0, den = 0.0;
+        for (int j = 0; j < cfg.d; ++j) {
+            double d_ = X[j] - w_ref[j];
+            num += d_*d_;
+            den += static_cast<double>(w_ref[j])*w_ref[j];
+        }
+        double rel = (den > 1e-12) ? std::sqrt(num/den) : 0.0;
+        max_rel_err = std::max(max_rel_err, rel);
+    }
+    // Check a few cold tokens
+    for (int cs = 0; cs < std::min(5, model.cold.Vc); ++cs) {
+        int gid = model.cold.global_ids[cs];
+        master.get_row_fp32(gid, w_ref.data());
+        auto X = model.forward({gid});
+        double num = 0.0, den = 0.0;
+        for (int j = 0; j < cfg.d; ++j) {
+            double d_ = X[j] - w_ref[j];
+            num += d_*d_;
+            den += static_cast<double>(w_ref[j])*w_ref[j];
+        }
+        double rel = (den > 1e-12) ? std::sqrt(num/den) : 0.0;
+        max_rel_err = std::max(max_rel_err, rel);
+    }
+
+    if (g_verbose)
+        std::printf("     max rel fidelity error = %.6f\n", max_rel_err);
+
+    EXPECT_TRUE(max_rel_err < 0.05,
+        "S2.4 compress_master: tiered fwd matches W_master within 5% rel error");
+}
+
+// =============================================================================
+// S2.5 — TierAllocator: reallocate changes hot set based on grad norm
+// =============================================================================
+static void test_s2_tier_allocator() {
+    print_section("S2.5 TierAllocator Dynamic Reallocation");
+
+    int V = 256, K = 64;
+    auto freq = zipf_frequencies(V);
+
+    TierAllocator alloc;
+    alloc.init(V, 300, 0.3f);
+
+    // Record high grad norms for low-frequency tokens (should promote them)
+    // Low-frequency tokens in Zipf are high-index (e.g. 200-255)
+    for (int t = 200; t < 256; ++t)
+        for (int rep = 0; rep < 10; ++rep)
+            alloc.record_grad_norm(t, 10.0f);  // very high gradient
+
+    // High-frequency tokens (top-64) have been seen by freq only
+    auto new_hot = alloc.reallocate(freq, K);
+
+    EXPECT_TRUE((int)new_hot.size() == K,
+        "S2.5 TierAllocator: reallocate returns exactly K tokens");
+
+    // Check that at least one high-grad-norm token (200-255) was promoted
+    int promoted = 0;
+    for (int id : new_hot)
+        if (id >= 200 && id < 256) ++promoted;
+
+    if (g_verbose)
+        std::printf("     promoted high-grad tokens (ids 200-255): %d / %d\n",
+                    promoted, K);
+
+    EXPECT_TRUE(promoted > 0,
+        "S2.5 TierAllocator: high-grad tokens promoted to hot tier");
+
+    // After reallocate, accumulations are reset
+    EXPECT_TRUE(std::all_of(alloc.grad_norm_accum.begin(),
+                             alloc.grad_norm_accum.end(),
+                             [](fp32 v){ return v == 0.0f; }),
+        "S2.5 TierAllocator: accumulators reset after reallocate");
+}
+
+// =============================================================================
+// S2.6 — Composite loss terms: L_ortho, L_align, L_quant are finite and ≥ 0
+// =============================================================================
+static void test_s2_composite_loss_terms() {
+    print_section("S2.6 Composite Loss Terms");
+
+    HFAQEConfig cfg; cfg.V=256; cfg.d=64; cfg.r=16; cfg.K=64; cfg.B=64;
+    HFAQE model(cfg);
+    auto freq = zipf_frequencies(256);
+    model.build_frequency_tiers(freq);
+    model.initialize_weights(42);
+
+    MasterLatent master;
+    init_master_from_hfaqe(master, model);
+
+    // L_ortho
+    fp32 l_ortho = compute_L_ortho(model.cold.Basis.data(), cfg.d, cfg.r);
+    EXPECT_TRUE(std::isfinite(l_ortho) && l_ortho >= 0.0f,
+        "S2.6 L_ortho: finite and >= 0");
+
+    // L_align
+    std::vector<int> hot_ids(model.hot.global_ids.begin(),
+                              model.hot.global_ids.end());
+    fp32 l_align = compute_L_align(master, hot_ids, cfg.V, cfg.d);
+    EXPECT_TRUE(std::isfinite(l_align) && l_align >= 0.0f,
+        "S2.6 L_align: finite and >= 0");
+
+    // L_quant
+    fp32 l_quant = compute_L_quant(master, cfg.V, cfg.d, cfg.B);
+    EXPECT_TRUE(std::isfinite(l_quant) && l_quant >= 0.0f,
+        "S2.6 L_quant: finite and >= 0");
+
+    // Semantic centroids finite
+    std::vector<fp32> centroids(N_CLASSES * cfg.d);
+    compute_class_centroids(master, cfg.V, cfg.d, centroids.data());
+    bool cent_finite = true;
+    for (fp32 v : centroids) if (!std::isfinite(v)) { cent_finite = false; break; }
+    EXPECT_TRUE(cent_finite, "S2.6 class centroids: all finite");
+
+    if (g_verbose)
+        std::printf("     L_ortho=%.4f  L_align=%.4f  L_quant=%.4f\n",
+                    l_ortho, l_align, l_quant);
+}
+
+// =============================================================================
+// S2.7 — AdamWMasterState: parameter changes after update_all
+// =============================================================================
+static void test_s2_adamw_master_update() {
+    print_section("S2.7 AdamWMasterState Parameter Update");
+
+    int V = 256, d = 64;
+    MasterLatent master;
+    master.allocate(V, d);
+    master.init_gaussian(0.02f, 123);
+
+    // Snapshot W before
+    std::vector<fp16> W_before = master.W;
+
+    // Set non-zero gradient
+    for (int t = 0; t < V; ++t) {
+        fp32* dw = master.row_dw(t);
+        for (int j = 0; j < d; ++j) dw[j] = 0.1f;
+    }
+
+    AdamWMasterState adam;
+    adam.init(V, d);
+    adam.update_all(master, 1e-3f, 0.9f, 0.999f, 1e-8f, 1e-2f);
+
+    // W must have changed
+    bool changed = false;
+    for (size_t i = 0; i < master.W.size(); ++i)
+        if (master.W[i] != W_before[i]) { changed = true; break; }
+    EXPECT_TRUE(changed, "S2.7 AdamW: W_master updated after update_all");
+
+    // W must remain finite
+    bool finite_ok = true;
+    std::vector<fp32> row(d);
+    for (int t = 0; t < V; ++t) {
+        master.get_row_fp32(t, row.data());
+        for (fp32 v : row) if (!std::isfinite(v)) { finite_ok = false; break; }
+        if (!finite_ok) break;
+    }
+    EXPECT_TRUE(finite_ok, "S2.7 AdamW: W_master remains finite after update");
+
+    // Tier-specific LR: cold tokens should change more (gamma_cold=2)
+    master.allocate(V, d);
+    master.init_gaussian(0.02f, 456);
+    for (int t = 0; t < V; ++t) {
+        fp32* dw = master.row_dw(t);
+        for (int j = 0; j < d; ++j) dw[j] = 0.1f;
+    }
+    std::vector<bool> is_hot(V, false);
+    for (int t = 0; t < 64; ++t) is_hot[t] = true;  // first 64 are hot
+
+    AdamWMasterState adam2;
+    adam2.init(V, d);
+
+    std::vector<fp16> W_before2 = master.W;
+    adam2.update_all(master, 1e-3f, 0.9f, 0.999f, 1e-8f, 1e-2f,
+                     &is_hot, 1.0f, 2.0f);
+
+    // Cold tokens should show bigger change magnitude than hot tokens
+    double delta_hot = 0.0, delta_cold = 0.0;
+    for (int t = 0; t < V; ++t) {
+        fp32 wb = bf16_to_f32(W_before2[t*d]);   // first element
+        fp32 wa = bf16_to_f32(master.W[t*d]);
+        double delta = std::abs(static_cast<double>(wa - wb));
+        if (is_hot[t]) delta_hot  += delta;
+        else           delta_cold += delta;
+    }
+    if (g_verbose)
+        std::printf("     avg delta_hot=%.6f  avg delta_cold=%.6f\n",
+                    delta_hot/64, delta_cold/(V-64));
+    EXPECT_TRUE(delta_cold > delta_hot,
+        "S2.7 AdamW: cold tokens change more than hot (gamma_cold=2 > gamma_hot=1)");
+}
+
+// =============================================================================
+// S2.8 — init_master_from_hfaqe: no zero rows, faithful reconstruction
+// =============================================================================
+static void test_s2_init_master_from_hfaqe() {
+    print_section("S2.8 init_master_from_hfaqe Fidelity");
+
+    HFAQE model = make_test_model(256, 64, 16, 64, 64);
+    MasterLatent master;
+    init_master_from_hfaqe(master, model);
+
+    // Every row must be non-zero (model was initialized with weights)
+    int zero_rows = 0;
+    std::vector<fp32> row(64);
+    for (int t = 0; t < 256; ++t) {
+        master.get_row_fp32(t, row.data());
+        fp32 norm = 0.0f;
+        for (fp32 v : row) norm += v*v;
+        if (norm < 1e-10f) ++zero_rows;
+    }
+    EXPECT_TRUE(zero_rows == 0,
+        "S2.8 init_master: all V rows of W_master are non-zero");
+
+    if (g_verbose)
+        std::printf("     zero rows = %d / 256\n", zero_rows);
+
+    // Hot rows: dequant error between W_master and model.forward should be small
+    double max_rel = 0.0;
+    for (int slot = 0; slot < std::min(5, model.hot.K); ++slot) {
+        int gid = model.hot.global_ids[slot];
+        master.get_row_fp32(gid, row.data());
+        auto X = model.forward({gid});
+        double num = 0.0, den = 0.0;
+        for (int j = 0; j < 64; ++j) {
+            double diff = X[j] - row[j];
+            num += diff*diff;
+            den += static_cast<double>(row[j])*row[j];
+        }
+        max_rel = std::max(max_rel, (den > 1e-12) ? std::sqrt(num/den) : 0.0);
+    }
+    EXPECT_TRUE(max_rel < 0.01,
+        "S2.8 init_master: hot rows match model.forward within 1% (int8 error)");
+
+    if (g_verbose)
+        std::printf("     max hot rel error = %.6f\n", max_rel);
+}
+
+// =============================================================================
+// S2 Suite runner
+// =============================================================================
+static void test_stage2_suite() {
+    std::printf("\n");
+    std::printf("╔════════════════════════════════════════════════════════╗\n");
+    std::printf("║   STAGE 2 TEST SUITE  (S2.1 – S2.8)                  ║\n");
+    std::printf("╚════════════════════════════════════════════════════════╝\n");
+
+    test_s2_master_latent_basics();
+    test_s2_ste_gradient_flow();
+    test_s2_gram_schmidt();
+    test_s2_compress_round_trip();
+    test_s2_tier_allocator();
+    test_s2_composite_loss_terms();
+    test_s2_adamw_master_update();
+    test_s2_init_master_from_hfaqe();
+
+    std::printf("╔════════════════════════════════════════════════════════╗\n");
+    std::printf("║   Stage 2 tests complete.                             ║\n");
+    std::printf("╚════════════════════════════════════════════════════════╝\n");
+}

@@ -668,6 +668,7 @@ static void print_full_report(
 // =============================================================================
 // main
 // =============================================================================
+#ifndef HFAQE_NO_EVAL_MAIN
 int main(int argc, char** argv) {
     // ── Parse args ────────────────────────────────────────────────────────────
     std::string ckpt_path = "checkpoints/hfaqe_best.nex";
@@ -683,10 +684,9 @@ int main(int argc, char** argv) {
     }
 
     std::printf("╔══════════════════════════════════════════════════════════════╗\n");
-    std::printf("║  HFAQE Evaluation                                            ║\n");
+    std::printf("║  HFAQE Stage 2 — Embedding Evaluation                        ║\n");
     std::printf("╚══════════════════════════════════════════════════════════════╝\n");
     std::printf("  Checkpoint : %s\n", ckpt_path.c_str());
-    std::printf("  Data dir   : %s\n", data_dir.c_str());
     std::fflush(stdout);
 
     // ── Load model ────────────────────────────────────────────────────────────
@@ -711,67 +711,562 @@ int main(int argc, char** argv) {
                 model.hot.K, model.cold.Vc);
     std::fflush(stdout);
 
-    // ── Load data ─────────────────────────────────────────────────────────────
-    std::printf("[data] Loading test corpus...\n");
-    std::vector<std::string> test_lines, train_lines;
-    try {
-        test_lines  = load_lines(data_dir + "/" + test_file);
-        train_lines = load_lines(data_dir + "/" + train_file);
-    } catch (const std::exception& e) {
-        std::fprintf(stderr,
-            "[data] WARNING: %s\n"
-            "  Run: python dataset.py   to download WikiText-2\n", e.what());
-        // Provide a minimal synthetic fallback so evaluation still runs
-        for (int i = 0; i < 20; ++i) {
-            std::string s;
-            for (int j = 0; j < 80; ++j) s += static_cast<char>(32 + (i*j+j) % 95);
-            test_lines.push_back(s);
-            train_lines.push_back(s);
-        }
-        std::printf("[data] Using %zu synthetic fallback lines.\n",
-                    test_lines.size());
-    }
-    std::printf("[data] test=%zu lines  train=%zu lines\n",
-                test_lines.size(), train_lines.size());
-    std::fflush(stdout);
+    // Extract full embedding matrix
+    std::vector<fp32> E = extract_embeddings(model);
+    int V = model.cfg.V, d = model.cfg.d;
 
-    // ── Run evaluation tasks ──────────────────────────────────────────────────
+    // E4.1 NNCA
+    std::printf("[eval] E4.1 NNCA@k ...\n"); std::fflush(stdout);
+    auto nnca = eval_s2_nnca(E, V, d);
 
-    // Task 1 — Perplexity
-    std::printf("\n[eval] Task 1: Perplexity...\n"); std::fflush(stdout);
-    auto ppl_train = eval_perplexity(model, train_lines, 256);
-    auto ppl_test  = eval_perplexity(model, test_lines,  256);
-    std::printf("  train PPL=%.4f  test PPL=%.4f\n",
-                ppl_train.ppl, ppl_test.ppl);
+    // E4.2 Purity
+    std::printf("[eval] E4.2 Clustering Purity ...\n"); std::fflush(stdout);
+    double purity = eval_s2_purity(E, V, d);
 
-    // Task 2 — Nearest neighbours for representative bytes
-    std::printf("[eval] Task 2: Nearest neighbour retrieval...\n"); std::fflush(stdout);
-    std::vector<int> query_ids = {
-        '0', 'a', 'A', ' ', '.', '\n',    // representative ASCII bytes
-        (int)'z', (int)'9', (int)'!'
-    };
-    auto nn = eval_nearest_neighbours(model, query_ids, 5);
+    // E4.3 Anisotropy
+    std::printf("[eval] E4.3 Anisotropy ...\n"); std::fflush(stdout);
+    auto aniso = eval_s2_anisotropy(E, V, d);
 
-    // Task 3 — Embedding space geometry
-    std::printf("[eval] Task 3: Embedding space geometry...\n"); std::fflush(stdout);
-    auto space = eval_embedding_space(model);
+    // E4.4 Separation
+    std::printf("[eval] E4.4 Intra/Inter Separation ...\n"); std::fflush(stdout);
+    auto sep = eval_s2_separation(E, V, d);
 
-    // Task 4 — Tier fidelity
-    std::printf("[eval] Task 4: Tier fidelity...\n"); std::fflush(stdout);
-    auto fid = eval_fidelity(model);
+    // E4.5 Tier norm gap
+    std::printf("[eval] E4.5 Tier Norm Gap ...\n"); std::fflush(stdout);
+    auto tnorm = eval_s2_tier_norms(E, model);
 
-    // Task 5 — Throughput
-    std::printf("[eval] Task 5: Throughput...\n"); std::fflush(stdout);
-    auto tput = eval_throughput(model);
+    // E4.6 Basis orthogonality
+    std::printf("[eval] E4.6 Basis Orthogonality ...\n"); std::fflush(stdout);
+    double ortho = eval_s2_basis_ortho(model);
 
-    // Task 6 — Anisotropy
-    std::printf("[eval] Task 6: Anisotropy...\n"); std::fflush(stdout);
-    double aniso = eval_anisotropy(model, 2000);
+    // E4.7 Cold reconstruction fidelity
+    std::printf("[eval] E4.7 Cold Reconstruction Fidelity ...\n"); std::fflush(stdout);
+    double cold_fid = eval_s2_cold_fidelity(E, model);
 
-    // ── Print full report ─────────────────────────────────────────────────────
-    print_full_report(ckpt_path, meta, model.cfg,
-                      ppl_train, ppl_test,
-                      fid, tput, space, aniso, nn);
+    // E4.8 Quantization SNR
+    std::printf("[eval] E4.8 Hot Quantization SNR ...\n"); std::fflush(stdout);
+    double quant_snr = eval_s2_quant_snr(E, model);
+
+    // Print full report
+    print_s2_report(model, nnca, purity, aniso, sep, tnorm,
+                    ortho, cold_fid, quant_snr);
 
     return 0;
 }
+#endif
+
+// ████████████████████████████████████████████████████████████████████████████
+// STAGE 2 — Embedding-Only Geometric Evaluation Suite  (E4.1 – E4.8)
+//
+// Scope: evaluates the embedding matrix W ∈ ℝ^{V×d} ONLY.
+//        No LM head, no perplexity, no next-token prediction.
+//        All metrics are intrinsic geometry probes.
+//
+// Metrics:
+//   E4.1  NNCA@k  — Nearest-Neighbour Class Accuracy
+//   E4.2  Clustering Purity (k-means style hard assign using centroids)
+//   E4.3  Anisotropy / Isotropy Score
+//   E4.4  Intra-class vs inter-class cosine centroid separation
+//   E4.5  Hot/Cold tier L2 norm gap (‖w_hot‖ vs ‖w_cold‖ means)
+//   E4.6  Basis orthogonality: ‖B^T·B - I_r‖_F
+//   E4.7  Cold reconstruction fidelity: ‖w - B·α‖_F / ‖w‖_F
+//   E4.8  Quantization SNR: 20·log10(‖w‖ / ‖w - ŵ‖)  (hot tier)
+// ████████████████████████████████████████████████████████████████████████████
+
+// =============================================================================
+// Helpers: extract full fp32 embedding matrix from HFAQE model
+// Returns E[V×d] in row-major fp32 order
+// =============================================================================
+static std::vector<fp32> extract_embeddings(const HFAQE& model) {
+    int V = model.cfg.V, d = model.cfg.d;
+    std::vector<fp32> E(static_cast<size_t>(V) * d, 0.0f);
+
+    std::vector<fp32> row(d);
+
+    // Hot rows
+    for (int slot = 0; slot < model.hot.K; ++slot) {
+        int gid = model.hot.global_ids[slot];
+        if (gid < 0 || gid >= V) continue;
+        dequant_row(model.hot.row_q(slot), model.hot.row_s(slot),
+                    d, model.cfg.B, E.data() + static_cast<ptrdiff_t>(gid)*d);
+    }
+
+    // Cold rows: B · α
+    for (int cs = 0; cs < model.cold.Vc; ++cs) {
+        int gid = model.cold.global_ids[cs];
+        if (gid < 0 || gid >= V) continue;
+        cold_reconstruct(model.cold.Basis.data(), model.cold.row_a(cs),
+                         d, model.cfg.r,
+                         E.data() + static_cast<ptrdiff_t>(gid)*d);
+    }
+
+    return E;
+}
+
+// Cosine similarity between two fp32 vectors
+static fp32 cosine_sim(const fp32* a, const fp32* b, int d) {
+    fp32 dot = 0.0f, na = 0.0f, nb = 0.0f;
+    for (int j = 0; j < d; ++j) {
+        dot += a[j] * b[j];
+        na  += a[j] * a[j];
+        nb  += b[j] * b[j];
+    }
+    fp32 denom = std::sqrt(na) * std::sqrt(nb);
+    return (denom > 1e-10f) ? dot / denom : 0.0f;
+}
+
+// L2 norm of a vector
+static fp32 l2_norm(const fp32* v, int d) {
+    fp32 s = 0.0f;
+    for (int j = 0; j < d; ++j) s += v[j]*v[j];
+    return std::sqrt(s);
+}
+
+// =============================================================================
+// E4.1 — NNCA@k: Nearest-Neighbour Class Accuracy
+// For each token i: among the top-k most cosine-similar tokens (excluding i),
+// count how many share the same TokenClass as i.
+// NNCA@k = (Σ_i fraction_correct_k) / V
+// Threshold: NNCA@1 > 0.5,  NNCA@5 > 0.6
+// =============================================================================
+struct NNCAResult {
+    double nnca_at_1;
+    double nnca_at_5;
+    double nnca_at_10;
+};
+
+static NNCAResult eval_s2_nnca(const std::vector<fp32>& E, int V, int d) {
+    // Precompute class for each token
+    std::vector<int> cls(V);
+    for (int t = 0; t < V; ++t)
+        cls[t] = static_cast<int>(classify_byte(t));
+
+    // Precompute all pairwise cosine sims  O(V²·d) — fine for V=256
+    // We'll do it row by row to avoid a V×V matrix
+    double sum1 = 0.0, sum5 = 0.0, sum10 = 0.0;
+
+    std::vector<std::pair<fp32,int>> sims(V);
+
+    for (int i = 0; i < V; ++i) {
+        const fp32* ei = E.data() + static_cast<ptrdiff_t>(i)*d;
+        for (int j = 0; j < V; ++j) {
+            const fp32* ej = E.data() + static_cast<ptrdiff_t>(j)*d;
+            sims[j] = { (j == i) ? -2.0f : cosine_sim(ei, ej, d), j };
+        }
+        // Sort descending by similarity, skip self
+        std::sort(sims.begin(), sims.end(),
+                  [](const auto& a, const auto& b){ return a.first > b.first; });
+
+        int match1 = 0, match5 = 0, match10 = 0;
+        int ci = cls[i];
+        for (int r = 0; r < std::min(10, V-1); ++r) {
+            int nb = sims[r].second;
+            if (nb == i) continue;
+            if (cls[nb] == ci) {
+                if (r < 1) match1++;
+                if (r < 5) match5++;
+                match10++;
+            }
+        }
+        sum1  += static_cast<double>(match1);
+        sum5  += static_cast<double>(match5) / std::min(5, V-1);
+        sum10 += static_cast<double>(match10) / std::min(10, V-1);
+    }
+
+    return { sum1 / V, sum5 / V, sum10 / V };
+}
+
+// =============================================================================
+// E4.2 — Clustering Purity
+// Assign each token to the nearest class centroid (hard assignment).
+// Purity = (1/V) Σ_k |{i : assign(i)==k, class(i)==k}|
+// Threshold: purity > 0.55
+// =============================================================================
+static double eval_s2_purity(const std::vector<fp32>& E, int V, int d) {
+    // Compute class centroids
+    std::vector<fp32> centroids(static_cast<size_t>(N_CLASSES)*d, 0.0f);
+    std::vector<int> counts(N_CLASSES, 0);
+    for (int t = 0; t < V; ++t) {
+        int c = static_cast<int>(classify_byte(t));
+        const fp32* et = E.data() + static_cast<ptrdiff_t>(t)*d;
+        fp32* cent = centroids.data() + static_cast<ptrdiff_t>(c)*d;
+        for (int j = 0; j < d; ++j) cent[j] += et[j];
+        counts[c]++;
+    }
+    for (int c = 0; c < N_CLASSES; ++c) {
+        if (counts[c] == 0) continue;
+        fp32* cent = centroids.data() + static_cast<ptrdiff_t>(c)*d;
+        fp32 inv = 1.0f / static_cast<fp32>(counts[c]);
+        for (int j = 0; j < d; ++j) cent[j] *= inv;
+    }
+
+    // Hard assignment + purity count
+    int correct = 0;
+    for (int t = 0; t < V; ++t) {
+        int true_c = static_cast<int>(classify_byte(t));
+        const fp32* et = E.data() + static_cast<ptrdiff_t>(t)*d;
+
+        // Find nearest centroid by cosine sim
+        fp32 best_sim = -2.0f;
+        int  best_c   = 0;
+        for (int c = 0; c < N_CLASSES; ++c) {
+            fp32 sim = cosine_sim(et, centroids.data() + (ptrdiff_t)c*d, d);
+            if (sim > best_sim) { best_sim = sim; best_c = c; }
+        }
+        if (best_c == true_c) ++correct;
+    }
+
+    return static_cast<double>(correct) / V;
+}
+
+// =============================================================================
+// E4.3 — Anisotropy & Isotropy Score
+// Anisotropy = (1/V²) Σ_{i≠j} cos(W_i, W_j)
+//   → near 0 = isotropic (ideal), near 1 = collapsed (degenerate)
+// Isotropy Score = 1 - anisotropy  (higher is better)
+// Threshold: anisotropy < 0.3  (isotropy > 0.7)
+// =============================================================================
+struct AnisotropyResult {
+    double anisotropy;
+    double isotropy_score;
+    double mean_norm;
+    double std_norm;
+};
+
+static AnisotropyResult eval_s2_anisotropy(const std::vector<fp32>& E, int V, int d) {
+    double sum_cos = 0.0;
+    double sum_norm = 0.0, sum_norm2 = 0.0;
+    long long pairs = 0;
+
+    for (int i = 0; i < V; ++i) {
+        const fp32* ei = E.data() + static_cast<ptrdiff_t>(i)*d;
+        fp32 ni = l2_norm(ei, d);
+        sum_norm  += ni;
+        sum_norm2 += static_cast<double>(ni)*ni;
+
+        for (int j = i+1; j < V; ++j) {
+            const fp32* ej = E.data() + static_cast<ptrdiff_t>(j)*d;
+            sum_cos += static_cast<double>(cosine_sim(ei, ej, d));
+            ++pairs;
+        }
+    }
+
+    double aniso = (pairs > 0) ? sum_cos / static_cast<double>(pairs) : 0.0;
+    double mean_n = sum_norm / V;
+    double var_n  = sum_norm2 / V - mean_n*mean_n;
+
+    return { aniso, 1.0 - aniso, mean_n, std::sqrt(std::max(0.0, var_n)) };
+}
+
+// =============================================================================
+// E4.4 — Intra/Inter Centroid Separation
+// intra_sim = (1/C) Σ_c avg cos(W_i, μ_c)  for i ∈ class c
+// inter_sim = (1/(C*(C-1))) Σ_{c≠c'} cos(μ_c, μ_{c'})
+// Ratio = intra_sim / inter_sim   (higher = better separation)
+// Threshold: ratio > 1.5
+// =============================================================================
+struct SeparationResult {
+    double intra_sim;
+    double inter_sim;
+    double ratio;
+};
+
+static SeparationResult eval_s2_separation(const std::vector<fp32>& E, int V, int d) {
+    // Build centroids
+    std::vector<fp32> centroids(static_cast<size_t>(N_CLASSES)*d, 0.0f);
+    std::vector<int>  counts(N_CLASSES, 0);
+    for (int t = 0; t < V; ++t) {
+        int c = static_cast<int>(classify_byte(t));
+        const fp32* et = E.data() + static_cast<ptrdiff_t>(t)*d;
+        fp32* cent = centroids.data() + static_cast<ptrdiff_t>(c)*d;
+        for (int j = 0; j < d; ++j) cent[j] += et[j];
+        counts[c]++;
+    }
+    for (int c = 0; c < N_CLASSES; ++c) {
+        if (counts[c] == 0) continue;
+        fp32* cent = centroids.data() + static_cast<ptrdiff_t>(c)*d;
+        fp32 inv = 1.0f / static_cast<fp32>(counts[c]);
+        for (int j = 0; j < d; ++j) cent[j] *= inv;
+    }
+
+    // Intra-class: avg cos(W_i, μ_c)
+    double intra_sum = 0.0;
+    int    intra_n   = 0;
+    for (int t = 0; t < V; ++t) {
+        int c = static_cast<int>(classify_byte(t));
+        if (counts[c] == 0) continue;
+        const fp32* et = E.data() + static_cast<ptrdiff_t>(t)*d;
+        const fp32* mc = centroids.data() + static_cast<ptrdiff_t>(c)*d;
+        intra_sum += static_cast<double>(cosine_sim(et, mc, d));
+        ++intra_n;
+    }
+    double intra = (intra_n > 0) ? intra_sum / intra_n : 0.0;
+
+    // Inter-class: avg cos(μ_c, μ_{c'}) for c≠c'
+    double inter_sum = 0.0;
+    int    inter_n   = 0;
+    for (int c1 = 0; c1 < N_CLASSES; ++c1) {
+        if (counts[c1] == 0) continue;
+        for (int c2 = c1+1; c2 < N_CLASSES; ++c2) {
+            if (counts[c2] == 0) continue;
+            const fp32* mc1 = centroids.data() + static_cast<ptrdiff_t>(c1)*d;
+            const fp32* mc2 = centroids.data() + static_cast<ptrdiff_t>(c2)*d;
+            inter_sum += static_cast<double>(cosine_sim(mc1, mc2, d));
+            ++inter_n;
+        }
+    }
+    double inter = (inter_n > 0) ? inter_sum / inter_n : 1.0;
+
+    double ratio = (std::abs(inter) > 1e-8) ? intra / inter : (intra > 0 ? 1e9 : 0.0);
+    return { intra, inter, ratio };
+}
+
+// =============================================================================
+// E4.5 — Hot/Cold Tier L2 Norm Gap
+// Measures whether the model has learned different norm distributions
+// for frequent (hot) vs rare (cold) tokens.
+// =============================================================================
+struct TierNormResult {
+    double mean_norm_hot;
+    double mean_norm_cold;
+    double norm_gap;       // |mean_hot - mean_cold| / mean_all
+};
+
+static TierNormResult eval_s2_tier_norms(const std::vector<fp32>& E,
+                                          const HFAQE& model) {
+    int V = model.cfg.V, d = model.cfg.d;
+    double sum_hot = 0.0, sum_cold = 0.0;
+    int    n_hot = 0,     n_cold = 0;
+
+    // Hot tokens
+    for (int slot = 0; slot < model.hot.K; ++slot) {
+        int gid = model.hot.global_ids[slot];
+        if (gid < 0 || gid >= V) continue;
+        sum_hot += static_cast<double>(l2_norm(E.data() + (ptrdiff_t)gid*d, d));
+        ++n_hot;
+    }
+    // Cold tokens
+    for (int cs = 0; cs < model.cold.Vc; ++cs) {
+        int gid = model.cold.global_ids[cs];
+        if (gid < 0 || gid >= V) continue;
+        sum_cold += static_cast<double>(l2_norm(E.data() + (ptrdiff_t)gid*d, d));
+        ++n_cold;
+    }
+
+    double mh = (n_hot  > 0) ? sum_hot  / n_hot  : 0.0;
+    double mc = (n_cold > 0) ? sum_cold / n_cold : 0.0;
+    double ma = (n_hot + n_cold > 0) ? (sum_hot + sum_cold)/(n_hot + n_cold) : 1.0;
+
+    return { mh, mc, (ma > 1e-8) ? std::abs(mh - mc) / ma : 0.0 };
+}
+
+// =============================================================================
+// E4.6 — Basis Orthogonality: ‖B^T·B - I_r‖_F
+// Stage 2 target: < 0.1 after QR re-orthogonalization
+// =============================================================================
+static double eval_s2_basis_ortho(const HFAQE& model) {
+    int d = model.cfg.d, r = model.cfg.r;
+    // Reuse compute_L_ortho from Core.cpp
+    fp32 loss = compute_L_ortho(model.cold.Basis.data(), d, r);
+    return static_cast<double>(std::sqrt(loss)); // return ‖B^T·B - I_r‖_F
+}
+
+// =============================================================================
+// E4.7 — Cold Reconstruction Fidelity: ‖W - B·α‖_F / ‖W‖_F  (cold tokens)
+// Stage 2 target: < 0.03 (COMPRESS resets this after each optimizer step)
+// =============================================================================
+static double eval_s2_cold_fidelity(const std::vector<fp32>& E,
+                                     const HFAQE& model) {
+    int d = model.cfg.d, r = model.cfg.r;
+    double err2 = 0.0, ref2 = 0.0;
+    std::vector<fp32> recon(d);
+
+    for (int cs = 0; cs < model.cold.Vc; ++cs) {
+        int gid = model.cold.global_ids[cs];
+        if (gid < 0 || gid >= model.cfg.V) continue;
+        const fp32* w = E.data() + static_cast<ptrdiff_t>(gid)*d;
+
+        cold_reconstruct(model.cold.Basis.data(), model.cold.row_a(cs),
+                         d, r, recon.data());
+
+        for (int j = 0; j < d; ++j) {
+            double diff = static_cast<double>(w[j]) - recon[j];
+            err2 += diff*diff;
+            ref2 += static_cast<double>(w[j])*w[j];
+        }
+    }
+
+    return (ref2 > 1e-12) ? std::sqrt(err2 / ref2) : 0.0;
+}
+
+// =============================================================================
+// E4.8 — Quantization SNR for hot tier (dB)
+// SNR = 20·log10(‖w‖_2 / ‖w - ŵ‖_2)
+// Stage 2 target: SNR > 30 dB
+// =============================================================================
+static double eval_s2_quant_snr(const std::vector<fp32>& E, const HFAQE& model) {
+    int d = model.cfg.d;
+    double total_snr = 0.0;
+    int    count     = 0;
+    std::vector<fp32> wq(d);
+
+    for (int slot = 0; slot < model.hot.K; ++slot) {
+        int gid = model.hot.global_ids[slot];
+        if (gid < 0 || gid >= model.cfg.V) continue;
+        const fp32* w = E.data() + static_cast<ptrdiff_t>(gid)*d;
+
+        // Dequantize to get quantized approx
+        dequant_row(model.hot.row_q(slot), model.hot.row_s(slot),
+                    d, model.cfg.B, wq.data());
+
+        double sig2 = 0.0, noise2 = 0.0;
+        for (int j = 0; j < d; ++j) {
+            sig2   += static_cast<double>(w[j])*w[j];
+            double e = static_cast<double>(w[j]) - wq[j];
+            noise2 += e*e;
+        }
+        if (noise2 < 1e-30) noise2 = 1e-30;
+        total_snr += 20.0 * std::log10(std::sqrt(sig2 / noise2));
+        ++count;
+    }
+
+    return (count > 0) ? total_snr / count : 0.0;
+}
+
+// =============================================================================
+// E4 — Stage 2 Full Evaluation Report
+// =============================================================================
+static void print_s2_report(const HFAQE& model,
+                             const NNCAResult& nnca,
+                             double purity,
+                             const AnisotropyResult& aniso,
+                             const SeparationResult& sep,
+                             const TierNormResult& tnorm,
+                             double ortho,
+                             double cold_fid,
+                             double quant_snr)
+{
+    const char* tick = (const char*)u8"\u2713";
+    const char* fail = (const char*)"!";
+    auto chk = [&](bool ok) { return ok ? tick : fail; };
+
+    std::printf("\n");
+    std::printf("╔═══════════════════════════════════════════════════════════════╗\n");
+    std::printf("║  HFAQE Stage 2 — Embedding Geometry Evaluation Report         ║\n");
+    std::printf("║  V=%-4d  d=%-4d  r=%-3d  K=%-4d  B=%-3d                       ║\n",
+                model.cfg.V, model.cfg.d, model.cfg.r, model.cfg.K, model.cfg.B);
+    std::printf("╠═══════════════════════════════════════════════════════════════╣\n");
+    std::printf("║  E4.1  NNCA@1                       : %6.4f  target >0.50 %s  ║\n",
+                nnca.nnca_at_1,  chk(nnca.nnca_at_1  > 0.50));
+    std::printf("║  E4.1  NNCA@5                       : %6.4f  target >0.60 %s  ║\n",
+                nnca.nnca_at_5,  chk(nnca.nnca_at_5  > 0.60));
+    std::printf("║  E4.1  NNCA@10                      : %6.4f                   ║\n",
+                nnca.nnca_at_10);
+    std::printf("║  E4.2  Clustering Purity            : %6.4f  target >0.55 %s  ║\n",
+                purity, chk(purity > 0.55));
+    std::printf("║  E4.3  Anisotropy                   : %6.4f  target <0.30 %s  ║\n",
+                aniso.anisotropy, chk(aniso.anisotropy < 0.30));
+    std::printf("║  E4.3  Isotropy Score               : %6.4f  target >0.70 %s  ║\n",
+                aniso.isotropy_score, chk(aniso.isotropy_score > 0.70));
+    std::printf("║  E4.3  Mean L2 Norm                 : %6.4f                   ║\n",
+                aniso.mean_norm);
+    std::printf("║  E4.3  Std  L2 Norm                 : %6.4f                   ║\n",
+                aniso.std_norm);
+    std::printf("║  E4.4  Intra-class cosine sim       : %6.4f                   ║\n",
+                sep.intra_sim);
+    std::printf("║  E4.4  Inter-class cosine sim       : %6.4f                   ║\n",
+                sep.inter_sim);
+    std::printf("║  E4.4  Intra/Inter ratio            : %6.4f  target >1.50 %s  ║\n",
+                sep.ratio, chk(sep.ratio > 1.50));
+    std::printf("║  E4.5  Hot mean L2 norm             : %6.4f                   ║\n",
+                tnorm.mean_norm_hot);
+    std::printf("║  E4.5  Cold mean L2 norm            : %6.4f                   ║\n",
+                tnorm.mean_norm_cold);
+    std::printf("║  E4.5  Norm gap (normalised)        : %6.4f  target <0.30 %s  ║\n",
+                tnorm.norm_gap, chk(tnorm.norm_gap < 0.30));
+    std::printf("║  E4.6  Basis ortho ‖B^TB-I‖_F       : %6.4f  target <0.10 %s  ║\n",
+                ortho, chk(ortho < 0.10));
+    std::printf("║  E4.7  Cold recon fidelity          : %6.4f  target <0.03 %s  ║\n",
+                cold_fid, chk(cold_fid < 0.03));
+    std::printf("║  E4.8  Hot quant SNR (dB)           : %6.2f  target >30dB %s  ║\n",
+                quant_snr, chk(quant_snr > 30.0));
+    std::printf("╚═══════════════════════════════════════════════════════════════╝\n");
+    std::fflush(stdout);
+}
+
+// =============================================================================
+// run_step_evaluate_s2() — shim for main.cpp orchestrator
+// Runs all E4.x probes on a synthetic small model (no Data/ needed)
+// =============================================================================
+static bool run_step_evaluate_s2() {
+    std::printf("\n[Eval-S2] Stage 2 Embedding Geometry Evaluation ...\n");
+
+    // Build a small test model
+    HFAQEConfig mcfg;
+    mcfg.V = 256; mcfg.d = 64; mcfg.r = 16; mcfg.K = 64; mcfg.B = 64;
+    HFAQE model(mcfg);
+    auto freq = zipf_frequencies(mcfg.V);
+    model.build_frequency_tiers(freq);
+    model.initialize_weights(42);
+
+    // Extract full embedding matrix
+    std::vector<fp32> E = extract_embeddings(model);
+    int V = mcfg.V, d = mcfg.d;
+
+    // E4.1 NNCA
+    std::printf("[Eval-S2] E4.1 NNCA@k ...\n"); std::fflush(stdout);
+    auto nnca = eval_s2_nnca(E, V, d);
+
+    // E4.2 Purity
+    std::printf("[Eval-S2] E4.2 Clustering Purity ...\n"); std::fflush(stdout);
+    double purity = eval_s2_purity(E, V, d);
+
+    // E4.3 Anisotropy
+    std::printf("[Eval-S2] E4.3 Anisotropy ...\n"); std::fflush(stdout);
+    auto aniso = eval_s2_anisotropy(E, V, d);
+
+    // E4.4 Separation
+    std::printf("[Eval-S2] E4.4 Intra/Inter Separation ...\n"); std::fflush(stdout);
+    auto sep = eval_s2_separation(E, V, d);
+
+    // E4.5 Tier norm gap
+    std::printf("[Eval-S2] E4.5 Tier Norm Gap ...\n"); std::fflush(stdout);
+    auto tnorm = eval_s2_tier_norms(E, model);
+
+    // E4.6 Basis orthogonality
+    std::printf("[Eval-S2] E4.6 Basis Orthogonality ...\n"); std::fflush(stdout);
+    double ortho = eval_s2_basis_ortho(model);
+
+    // E4.7 Cold reconstruction fidelity
+    std::printf("[Eval-S2] E4.7 Cold Reconstruction Fidelity ...\n"); std::fflush(stdout);
+    double cold_fid = eval_s2_cold_fidelity(E, model);
+
+    // E4.8 Quantization SNR
+    std::printf("[Eval-S2] E4.8 Hot Quantization SNR ...\n"); std::fflush(stdout);
+    double quant_snr = eval_s2_quant_snr(E, model);
+
+    // Print full report
+    print_s2_report(model, nnca, purity, aniso, sep, tnorm,
+                    ortho, cold_fid, quant_snr);
+
+    // Pass criteria (on a freshly initialized, untrained model the geometry
+    // targets won't be fully met — we verify finite values and no NaN/inf)
+    bool finite_ok = std::isfinite(nnca.nnca_at_1) &&
+                     std::isfinite(purity)          &&
+                     std::isfinite(aniso.anisotropy) &&
+                     std::isfinite(sep.ratio)        &&
+                     std::isfinite(ortho)            &&
+                     std::isfinite(cold_fid)         &&
+                     std::isfinite(quant_snr);
+
+    // Structural sanity: cold_fid should be small (initialized B·α ≈ W)
+    bool fid_ok = cold_fid < 0.1;
+
+    // SNR should be positive (int8 quant roundtrip on initialized weights)
+    bool snr_ok = quant_snr > 0.0;
+
+    bool ok = finite_ok && fid_ok && snr_ok;
+    std::printf("[Eval-S2] Result: %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+

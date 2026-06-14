@@ -119,6 +119,9 @@ static bool run_step_core() {
     model.build_frequency_tiers(freq);
     model.initialize_weights(42);
 
+    // Setup unified training
+    model.setup_training();
+
     std::printf("[Core] Hot tier  : K=%d  int8[%d×%d]\n", model.hot.K, model.hot.K, cfg.d);
     std::printf("[Core] Cold tier : Vc=%d  bf16[%d×%d]  Basis bf16[%d×%d]\n",
         model.cold.Vc, model.cold.Vc, cfg.r, cfg.d, cfg.r);
@@ -154,8 +157,8 @@ static bool run_step_core() {
     model.zero_grad();
     std::vector<fp32> dX(static_cast<size_t>(20) * cfg.d, 0.01f);
     model.backward(dX.data(), batch.data(), 20);
-    std::printf("[Core] Backward  grad_B size=%zu  nnz_cold_rows=%d\n",
-        model.grad_B.size(), model.nnz_grad_A_rows());
+    fp32 gnorm = model.master.grad_norm_master();
+    std::printf("[Core] Backward  gnorm_W=%.4f\n", gnorm);
 
     // --- Gradient apply ---
     std::vector<fp16> basis_snap = model.cold.Basis;
@@ -186,7 +189,7 @@ static bool run_step_core() {
     std::printf("[Core] Quant roundtrip  rel_err=%.2e  (SPEC bound < 0.005)\n", rel_err);
 
     bool ok = hot_finite && cold_finite && batch_ok && lm_ok && oob_ok
-              && weights_changed && rel_err < 0.005;
+              && weights_changed && rel_err < 0.005 && gnorm > 0.0f;
     std::printf("[Core] Result: %s\n", ok ? "PASS" : "FAIL");
     return ok;
 }
