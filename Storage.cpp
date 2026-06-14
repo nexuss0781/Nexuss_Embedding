@@ -87,6 +87,7 @@
 #include <stdexcept>
 #include <fstream>
 #include <sstream>
+#include <functional>
 #include <algorithm>
 #include <numeric>
 #include <chrono>
@@ -428,9 +429,27 @@ public:
 
         int n_sections = 6                       // HOT_Q, HOT_S, HOT_IDS,
                                                  // COLD_A, BASIS, COLD_IDS
-                       + (has_adam ? (unified_adam ? 2 : 4) : 0) // MM, MV or AM, AV, BM, BV
+                       + (has_adam ? (unified_adam ? 2 : 4) : 0)
                        + (has_freq ? 1 : 0)      // FREQ
                        + 1;                      // META
+
+        // Build directory (filled in later)
+        directory_.resize(n_sections);
+        std::memset(directory_.data(), 0, n_sections * sizeof(NexSectionEntry));
+
+        // Calculate directory offset and first data offset
+        size_t header_sz    = sizeof(NexHeader);
+        size_t dir_sz       = static_cast<size_t>(n_sections) * sizeof(NexSectionEntry);
+        size_t data_start   = align_up(header_sz + dir_sz, NEX_PAGE_SIZE);
+
+        // Placeholder header + directory — will be overwritten at close()
+        NexHeader hdr;
+        build_header(hdr, model, meta, n_sections, has_adam, has_freq);
+        std::fwrite(&hdr, sizeof(hdr), 1, fp_);
+        std::fwrite(directory_.data(), sizeof(NexSectionEntry), n_sections, fp_);
+
+        // Pad to data_start
+        write_padding(static_cast<size_t>(std::ftell(fp_)), data_start);
 
         // ── Write sections in order ────────────────────────────────────────
         int sec_idx = 0;
@@ -483,14 +502,6 @@ public:
         write_raw_section(sec_idx++, NEX_SEC_COLD_IDS,
             model.cold.global_ids.data(),
             model.cold.global_ids.size() * sizeof(int));
-
-        // AdamW state
-        if (has_adam) {
-            write_adam_section(sec_idx++, NEX_SEC_ADAM_AM, adam->m_A);
-            write_adam_section(sec_idx++, NEX_SEC_ADAM_AV, adam->v_A);
-            write_adam_section(sec_idx++, NEX_SEC_ADAM_BM, adam->m_B);
-            write_adam_section(sec_idx++, NEX_SEC_ADAM_BV, adam->v_B);
-        }
 
         // Token frequency histogram
         if (has_freq) {
