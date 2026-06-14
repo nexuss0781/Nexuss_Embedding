@@ -716,7 +716,8 @@ int main(int argc, char** argv) {
     CheckpointManager ckpt_mgr(ccfg);
 
     // ── Training state (declared before lambdas that capture them) ───────────
-    int   epoch         = start_epoch;
+    int   start_epoch   = 0;
+    int   epoch         = 0;
     float best_val_loss = 1e9f;
     float best_val_ppl  = 1e9f;
 
