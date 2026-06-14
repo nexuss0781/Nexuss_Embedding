@@ -716,14 +716,14 @@ int main(int argc, char** argv) {
     CheckpointManager ckpt_mgr(ccfg);
 
     // ── Training state (declared before lambdas that capture them) ───────────
-    int   start_epoch   = 0;
+    int   epoch         = start_epoch;
     float best_val_loss = 1e9f;
     float best_val_ppl  = 1e9f;
 
     auto save_ckpt = [&](const std::string& tag) {
         NexCheckpointMeta nmeta;
         nmeta.global_step   = model.global_step;
-        nmeta.epoch         = start_epoch;
+        nmeta.epoch         = epoch;
         nmeta.best_val_loss = best_val_loss;
         nmeta.best_val_ppl  = best_val_ppl;
         auto ns = to_nex_adam();
@@ -737,6 +737,7 @@ int main(int argc, char** argv) {
         if (ckpt_mgr.load(model, loaded_meta, &loaded_adam)) {
             model.global_step = loaded_meta.global_step;
             start_epoch       = loaded_meta.epoch;
+            epoch             = start_epoch;
             best_val_loss     = loaded_meta.best_val_loss;
             best_val_ppl      = loaded_meta.best_val_ppl;
             from_nex_adam(loaded_adam);
@@ -772,7 +773,7 @@ int main(int argc, char** argv) {
     // ═════════════════════════════════════════════════════════════════════════
     // Training loop
     // ═════════════════════════════════════════════════════════════════════════
-    for (int epoch = start_epoch; epoch < cfg.epochs && !g_stop_requested; ++epoch) {
+    for (; epoch < cfg.epochs && !g_stop_requested; ++epoch) {
 
         // Shuffle indices for this epoch
         std::vector<int> order(train_lines.size());
