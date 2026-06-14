@@ -417,7 +417,6 @@ public:
                const NexAdamState*    adam   = nullptr,
                const std::vector<fp32>* freq = nullptr)
     {
-        std::printf("[DEBUG] NexWriter::write starting...\n"); std::fflush(stdout);
         using Clock = std::chrono::system_clock;
         timestamp_ = static_cast<int64_t>(
             std::chrono::duration_cast<std::chrono::seconds>(
@@ -458,7 +457,6 @@ public:
 
         // AdamW state (Stage 2 Unified or Stage 1 Separated)
         if (has_adam) {
-            std::printf("[DEBUG] Writing ADAM sections...\n"); std::fflush(stdout);
             if (unified_adam) {
                 write_adam_section(sec_idx++, NEX_SEC_ADAM_MM, adam->m_master);
                 write_adam_section(sec_idx++, NEX_SEC_ADAM_MV, adam->v_master);
@@ -471,7 +469,6 @@ public:
         }
 
         // HOT_Q — delta-compressed int8 codes
-        std::printf("[DEBUG] Writing HOT_Q section (compress=%d)...\n", compress_); std::fflush(stdout);
         write_section(sec_idx++, NEX_SEC_HOT_Q,
             [&](std::vector<uint8_t>& buf) {
                 if (compress_) {
@@ -486,42 +483,35 @@ public:
             });
 
         // HOT_S — fp32 scales (no compression — already dense and varied)
-        std::printf("[DEBUG] Writing HOT_S section...\n"); std::fflush(stdout);
         write_raw_section(sec_idx++, NEX_SEC_HOT_S,
             model.hot.S_H.data(), model.hot.S_H.size() * sizeof(fp32));
 
         // HOT_IDS — int32 vocab mapping
-        std::printf("[DEBUG] Writing HOT_IDS section...\n"); std::fflush(stdout);
         write_raw_section(sec_idx++, NEX_SEC_HOT_IDS,
             model.hot.global_ids.data(),
             model.hot.global_ids.size() * sizeof(int));
 
         // COLD_A — bf16 coefficient matrix
-        std::printf("[DEBUG] Writing COLD_A section...\n"); std::fflush(stdout);
         write_raw_section(sec_idx++, NEX_SEC_COLD_A,
             model.cold.A.data(), model.cold.A.size() * sizeof(fp16));
 
         // BASIS — bf16 shared basis (col-major)
-        std::printf("[DEBUG] Writing BASIS section...\n"); std::fflush(stdout);
         write_raw_section(sec_idx++, NEX_SEC_BASIS,
             model.cold.Basis.data(), model.cold.Basis.size() * sizeof(fp16));
 
         // COLD_IDS
-        std::printf("[DEBUG] Writing COLD_IDS section...\n"); std::fflush(stdout);
         write_raw_section(sec_idx++, NEX_SEC_COLD_IDS,
             model.cold.global_ids.data(),
             model.cold.global_ids.size() * sizeof(int));
 
         // Token frequency histogram
         if (has_freq) {
-            std::printf("[DEBUG] Writing FREQ section...\n"); std::fflush(stdout);
             write_raw_section(sec_idx++, NEX_SEC_FREQ,
                 freq->data(), freq->size() * sizeof(fp32));
         }
 
         // Metadata key-value pairs
         {
-            std::printf("[DEBUG] Writing META section...\n"); std::fflush(stdout);
             std::string kv = build_meta_string(model, meta, adam);
             write_raw_section(sec_idx++, NEX_SEC_META,
                 kv.data(), kv.size());
@@ -530,30 +520,24 @@ public:
         total_sections_ = sec_idx;
 
         // ── Back-fill header + directory ──────────────────────────────────
-        std::printf("[DEBUG] Back-filling header and directory...\n"); std::fflush(stdout);
         build_header(hdr, model, meta, total_sections_, has_adam, has_freq);
         std::rewind(fp_);
         std::fwrite(&hdr, sizeof(hdr), 1, fp_);
         std::fwrite(directory_.data(), sizeof(NexSectionEntry),
                     total_sections_, fp_);
-        std::printf("[DEBUG] NexWriter::write complete.\n"); std::fflush(stdout);
     }
 
     // Flush + close + report
     size_t close() {
         if (!fp_) return 0;
-        std::printf("[DEBUG] NexWriter::close starting (flush + fsync)...\n"); std::fflush(stdout);
         std::fflush(fp_);
 #ifndef _WIN32
-        std::printf("[DEBUG] Calling fsync...\n"); std::fflush(stdout);
         ::fsync(::fileno(fp_));
-        std::printf("[DEBUG] fsync complete.\n"); std::fflush(stdout);
 #endif
         long sz = std::ftell(fp_);
         std::fclose(fp_);
         fp_ = nullptr;
         bytes_written_ = static_cast<size_t>(sz);
-        std::printf("[DEBUG] NexWriter::close complete. Bytes written: %zu\n", bytes_written_); std::fflush(stdout);
         return bytes_written_;
     }
 
@@ -1219,19 +1203,11 @@ private:
     }
 
     void update_latest(const std::string& src) const {
-        std::printf("[DEBUG] update_latest(src=%s) starting...\n", src.c_str()); std::fflush(stdout);
         std::string dst = latest_path();
         // Copy file (portable — avoid symlinks for Windows compat)
         std::ifstream in(src, std::ios::binary);
         std::ofstream out(dst, std::ios::binary | std::ios::trunc);
-        if (in && out) {
-            std::printf("[DEBUG]   Copying rdbuf from %s to %s...\n", src.c_str(), dst.c_str()); std::fflush(stdout);
-            out << in.rdbuf();
-            std::printf("[DEBUG]   Copy complete.\n"); std::fflush(stdout);
-        } else {
-            std::printf("[DEBUG]   ERROR: could not open src or dst for copy.\n"); std::fflush(stdout);
-        }
-        std::printf("[DEBUG] update_latest complete.\n"); std::fflush(stdout);
+        if (in && out) out << in.rdbuf();
     }
 
     std::string find_best_checkpoint() const {
@@ -1249,7 +1225,6 @@ private:
     }
 
     void rotate_step_checkpoints() const {
-        std::printf("[DEBUG] rotate_step_checkpoints starting...\n"); std::fflush(stdout);
         // Collect all step_*.nex files, sort by name (lexicographic = chronological)
         std::vector<std::string> files;
         // Simple glob via fopen attempts on expected names — or just list dir
@@ -1259,7 +1234,6 @@ private:
         {
             std::string cmd = "ls " + cfg_.ckpt_dir + "/" + cfg_.base_name
                             + "_step_*.nex 2>/dev/null";
-            std::printf("[DEBUG]   Running command: %s\n", cmd.c_str()); std::fflush(stdout);
             FILE* pipe = popen(cmd.c_str(), "r");
             if (pipe) {
                 char buf[512];
@@ -1268,19 +1242,15 @@ private:
                     if (n > 0 && buf[n-1] == '\n') buf[n-1] = '\0';
                     files.push_back(buf);
                 }
-                std::printf("[DEBUG]   Closing pipe...\n"); std::fflush(stdout);
                 pclose(pipe);
-                std::printf("[DEBUG]   Pipe closed.\n"); std::fflush(stdout);
             }
         }
 #endif
         std::sort(files.begin(), files.end());
         while ((int)files.size() > cfg_.keep_last) {
-            std::printf("[DEBUG]   Removing old checkpoint: %s\n", files.front().c_str()); std::fflush(stdout);
             std::remove(files.front().c_str());
             files.erase(files.begin());
         }
-        std::printf("[DEBUG] rotate_step_checkpoints complete.\n"); std::fflush(stdout);
     }
 };
 
