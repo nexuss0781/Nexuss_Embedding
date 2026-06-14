@@ -665,96 +665,6 @@ static void print_full_report(
     std::fflush(stdout);
 }
 
-// =============================================================================
-// main
-// =============================================================================
-#ifndef HFAQE_NO_EVAL_MAIN
-int main(int argc, char** argv) {
-    // ── Parse args ────────────────────────────────────────────────────────────
-    std::string ckpt_path = "checkpoints/hfaqe_best.nex";
-    std::string data_dir  = "Data";
-    std::string test_file = "test.txt";
-    std::string train_file= "train.txt";
-
-    for (int i = 1; i < argc; ++i) {
-        std::string a = argv[i];
-        if (a == "--data" && i+1 < argc)  data_dir  = argv[++i];
-        else if (a == "--test" && i+1 < argc) test_file = argv[++i];
-        else if (a[0] != '-')             ckpt_path = a;  // positional = checkpoint
-    }
-
-    std::printf("╔══════════════════════════════════════════════════════════════╗\n");
-    std::printf("║  HFAQE Stage 2 — Embedding Evaluation                        ║\n");
-    std::printf("╚══════════════════════════════════════════════════════════════╝\n");
-    std::printf("  Checkpoint : %s\n", ckpt_path.c_str());
-    std::fflush(stdout);
-
-    // ── Load model ────────────────────────────────────────────────────────────
-    std::printf("\n[load] Opening checkpoint...\n");
-    NexCheckpointMeta meta;
-    HFAQE model = [&]() -> HFAQE {
-        try {
-            return CheckpointManager::load_fresh(ckpt_path, &meta);
-        } catch (const std::exception& e) {
-            std::fprintf(stderr,
-                "[load] ERROR: %s\n"
-                "  Make sure you ran: ./train\n"
-                "  and that checkpoints/hfaqe_best.nex exists.\n",
-                e.what());
-            std::exit(1);
-        }
-    }();
-
-    std::printf("[load] Model loaded: V=%d d=%d r=%d K=%d  "
-                "hot=%d cold=%d\n",
-                model.cfg.V, model.cfg.d, model.cfg.r, model.cfg.K,
-                model.hot.K, model.cold.Vc);
-    std::fflush(stdout);
-
-    // Extract full embedding matrix
-    std::vector<fp32> E = extract_embeddings(model);
-    int V = model.cfg.V, d = model.cfg.d;
-
-    // E4.1 NNCA
-    std::printf("[eval] E4.1 NNCA@k ...\n"); std::fflush(stdout);
-    auto nnca = eval_s2_nnca(E, V, d);
-
-    // E4.2 Purity
-    std::printf("[eval] E4.2 Clustering Purity ...\n"); std::fflush(stdout);
-    double purity = eval_s2_purity(E, V, d);
-
-    // E4.3 Anisotropy
-    std::printf("[eval] E4.3 Anisotropy ...\n"); std::fflush(stdout);
-    auto aniso = eval_s2_anisotropy(E, V, d);
-
-    // E4.4 Separation
-    std::printf("[eval] E4.4 Intra/Inter Separation ...\n"); std::fflush(stdout);
-    auto sep = eval_s2_separation(E, V, d);
-
-    // E4.5 Tier norm gap
-    std::printf("[eval] E4.5 Tier Norm Gap ...\n"); std::fflush(stdout);
-    auto tnorm = eval_s2_tier_norms(E, model);
-
-    // E4.6 Basis orthogonality
-    std::printf("[eval] E4.6 Basis Orthogonality ...\n"); std::fflush(stdout);
-    double ortho = eval_s2_basis_ortho(model);
-
-    // E4.7 Cold reconstruction fidelity
-    std::printf("[eval] E4.7 Cold Reconstruction Fidelity ...\n"); std::fflush(stdout);
-    double cold_fid = eval_s2_cold_fidelity(E, model);
-
-    // E4.8 Quantization SNR
-    std::printf("[eval] E4.8 Hot Quantization SNR ...\n"); std::fflush(stdout);
-    double quant_snr = eval_s2_quant_snr(E, model);
-
-    // Print full report
-    print_s2_report(model, nnca, purity, aniso, sep, tnorm,
-                    ortho, cold_fid, quant_snr);
-
-    return 0;
-}
-#endif
-
 // ████████████████████████████████████████████████████████████████████████████
 // STAGE 2 — Embedding-Only Geometric Evaluation Suite  (E4.1 – E4.8)
 //
@@ -801,18 +711,6 @@ static std::vector<fp32> extract_embeddings(const HFAQE& model) {
     }
 
     return E;
-}
-
-// Cosine similarity between two fp32 vectors
-static fp32 cosine_sim(const fp32* a, const fp32* b, int d) {
-    fp32 dot = 0.0f, na = 0.0f, nb = 0.0f;
-    for (int j = 0; j < d; ++j) {
-        dot += a[j] * b[j];
-        na  += a[j] * a[j];
-        nb  += b[j] * b[j];
-    }
-    fp32 denom = std::sqrt(na) * std::sqrt(nb);
-    return (denom > 1e-10f) ? dot / denom : 0.0f;
 }
 
 // L2 norm of a vector
@@ -1269,4 +1167,95 @@ static bool run_step_evaluate_s2() {
     std::printf("[Eval-S2] Result: %s\n", ok ? "PASS" : "FAIL");
     return ok;
 }
+
+// =============================================================================
+// main
+// =============================================================================
+#ifndef HFAQE_NO_EVAL_MAIN
+int main(int argc, char** argv) {
+    // ── Parse args ────────────────────────────────────────────────────────────
+    std::string ckpt_path = "checkpoints/hfaqe_best.nex";
+    std::string data_dir  = "Data";
+    std::string test_file = "test.txt";
+    std::string train_file= "train.txt";
+
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--data" && i+1 < argc)  data_dir  = argv[++i];
+        else if (a == "--test" && i+1 < argc) test_file = argv[++i];
+        else if (a[0] != '-')             ckpt_path = a;  // positional = checkpoint
+    }
+
+    std::printf("╔══════════════════════════════════════════════════════════════╗\n");
+    std::printf("║  HFAQE Stage 2 — Embedding Evaluation                        ║\n");
+    std::printf("╚══════════════════════════════════════════════════════════════╝\n");
+    std::printf("  Checkpoint : %s\n", ckpt_path.c_str());
+    std::fflush(stdout);
+
+    // ── Load model ────────────────────────────────────────────────────────────
+    std::printf("\n[load] Opening checkpoint...\n");
+    NexCheckpointMeta meta;
+    HFAQE model = [&]() -> HFAQE {
+        try {
+            return CheckpointManager::load_fresh(ckpt_path, &meta);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr,
+                "[load] ERROR: %s\n"
+                "  Make sure you ran: ./train\n"
+                "  and that checkpoints/hfaqe_best.nex exists.\n",
+                e.what());
+            std::exit(1);
+        }
+    }();
+
+    std::printf("[load] Model loaded: V=%d d=%d r=%d K=%d  "
+                "hot=%d cold=%d\n",
+                model.cfg.V, model.cfg.d, model.cfg.r, model.cfg.K,
+                model.hot.K, model.cold.Vc);
+    std::fflush(stdout);
+
+    // Extract full embedding matrix
+    std::vector<fp32> E = extract_embeddings(model);
+    int V = model.cfg.V, d = model.cfg.d;
+
+    // E4.1 NNCA
+    std::printf("[eval] E4.1 NNCA@k ...\n"); std::fflush(stdout);
+    auto nnca = eval_s2_nnca(E, V, d);
+
+    // E4.2 Purity
+    std::printf("[eval] E4.2 Clustering Purity ...\n"); std::fflush(stdout);
+    double purity = eval_s2_purity(E, V, d);
+
+    // E4.3 Anisotropy
+    std::printf("[eval] E4.3 Anisotropy ...\n"); std::fflush(stdout);
+    auto aniso = eval_s2_anisotropy(E, V, d);
+
+    // E4.4 Separation
+    std::printf("[eval] E4.4 Intra/Inter Separation ...\n"); std::fflush(stdout);
+    auto sep = eval_s2_separation(E, V, d);
+
+    // E4.5 Tier norm gap
+    std::printf("[eval] E4.5 Tier Norm Gap ...\n"); std::fflush(stdout);
+    auto tnorm = eval_s2_tier_norms(E, model);
+
+    // E4.6 Basis orthogonality
+    std::printf("[eval] E4.6 Basis Orthogonality ...\n"); std::fflush(stdout);
+    double ortho = eval_s2_basis_ortho(model);
+
+    // E4.7 Cold reconstruction fidelity
+    std::printf("[eval] E4.7 Cold Reconstruction Fidelity ...\n"); std::fflush(stdout);
+    double cold_fid = eval_s2_cold_fidelity(E, model);
+
+    // E4.8 Quantization SNR
+    std::printf("[eval] E4.8 Hot Quantization SNR ...\n"); std::fflush(stdout);
+    double quant_snr = eval_s2_quant_snr(E, model);
+
+    // Print full report
+    print_s2_report(model, nnca, purity, aniso, sep, tnorm,
+                    ortho, cold_fid, quant_snr);
+
+    return 0;
+}
+#endif
+
 
