@@ -747,40 +747,53 @@ public:
 
     // -------------------------------------------------------------------
     // load — fill a pre-allocated HFAQE from all model sections
-    // The model must already have tiers allocated (call build_frequency_tiers
-    // + initialize_weights first, or use load_fresh() below).
+    // Dynamically resizes model tiers based on section sizes in the file.
     // -------------------------------------------------------------------
     void load(HFAQE& model) {
-        // HOT_Q
+        // Ensure config matches header
+        model.cfg = config();
+        int d = model.cfg.d;
+        int r = model.cfg.r;
+        int m = model.cfg.m();
+
+        // 1. Determine tier sizes from directory entries
+        auto& e_hq = find_section(NEX_SEC_HOT_Q);
+        auto& e_hi = find_section(NEX_SEC_HOT_IDS);
+        auto& e_ca = find_section(NEX_SEC_COLD_A);
+        auto& e_ci = find_section(NEX_SEC_COLD_IDS);
+
+        int K  = static_cast<int>(e_hi.size_bytes / sizeof(int));
+        int Vc = static_cast<int>(e_ci.size_bytes / sizeof(int));
+
+        // 2. Allocate/resize model buffers
+        model.hot.allocate(K, d, m);
+        model.cold.allocate(Vc, d, r);
+
+        // 3. Load Hot Tier
         {
-            auto& e = find_section(NEX_SEC_HOT_Q);
-            auto buf = read_section_bytes(e);
-            if (e.flags & 0x01u) {
+            auto buf = read_section_bytes(e_hq);
+            if (e_hq.flags & 0x01u) {
                 // Delta-compressed
                 delta_codec::decode_hot_q(buf,
-                    model.hot.Q_H.data(), model.hot.K, model.cfg.d);
+                    model.hot.Q_H.data(), K, d);
             } else {
                 std::memcpy(model.hot.Q_H.data(), buf.data(), buf.size());
             }
         }
-        // HOT_S
         load_raw(NEX_SEC_HOT_S, model.hot.S_H.data(),
                  model.hot.S_H.size() * sizeof(fp32));
-        // HOT_IDS
         load_raw(NEX_SEC_HOT_IDS, model.hot.global_ids.data(),
                  model.hot.global_ids.size() * sizeof(int));
 
-        // COLD_A
+        // 4. Load Cold Tier
         load_raw(NEX_SEC_COLD_A, model.cold.A.data(),
                  model.cold.A.size() * sizeof(fp16));
-        // BASIS
         load_raw(NEX_SEC_BASIS, model.cold.Basis.data(),
                  model.cold.Basis.size() * sizeof(fp16));
-        // COLD_IDS
         load_raw(NEX_SEC_COLD_IDS, model.cold.global_ids.data(),
                  model.cold.global_ids.size() * sizeof(int));
 
-        // Rebuild idx maps from loaded global_ids
+        // 5. Rebuild idx maps from loaded global_ids
         rebuild_idx(model);
     }
 
