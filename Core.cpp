@@ -1276,16 +1276,16 @@ public:
     // Training Hyperparameters (Default values matching SPEC)
     fp32 s2_beta = 0.3f;
     int s2_T_realloc = 300;
-    int s2_T_ortho = 100;
+    int s2_T_ortho = 50;
     fp32 s2_theta_clip = 1.0f;
     fp32 s2_tau = 0.05f;
-    fp32 s2_lambda_semantic = 0.1f;
+    fp32 s2_lambda_semantic = 0.2f;
     fp32 s2_lambda_align = 0.01f;
-    fp32 s2_lambda_ortho = 0.001f;
+    fp32 s2_lambda_ortho = 0.05f;
     fp32 s2_lambda_quant = 0.001f;
     fp32 s2_gamma_hot = 1.0f;
     fp32 s2_gamma_cold = 2.0f;
-    fp32 s2_gamma_basis = 0.5f;
+    fp32 s2_gamma_basis = 1.0f;
 
     explicit HFAQE(const HFAQEConfig& config) : cfg(config) {}
 
@@ -1714,8 +1714,9 @@ public:
         // 3. AdamW step on W_master
         adam_W.update_all(master, lr, 0.9f, 0.999f, 1e-8f, 0.01f, &is_hot_set, s2_gamma_hot, s2_gamma_cold);
 
-        // 4. Periodic QR re-orthogonalization
-        if (global_step > 0 && global_step % s2_T_ortho == 0) {
+        // 4. Threshold-based or periodic QR re-orthogonalization
+        fp32 current_ortho = compute_L_ortho(cold.Basis.data(), cfg.d, cfg.r);
+        if (global_step % s2_T_ortho == 0 || current_ortho > 0.1f) {
             gram_schmidt_qr(cold.Basis.data(), cfg.d, cfg.r);
         }
 

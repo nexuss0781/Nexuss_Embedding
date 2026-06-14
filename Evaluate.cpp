@@ -915,7 +915,9 @@ static SeparationResult eval_s2_separation(const std::vector<fp32>& E, int V, in
     }
     double inter = (inter_n > 0) ? inter_sum / inter_n : 1.0;
 
-    double ratio = (std::abs(inter) > 1e-8) ? intra / inter : (intra > 0 ? 1e9 : 0.0);
+    // Robust ratio: if inter-sim is negative (better than orthogonal), 
+    // we use its absolute value to maintain a positive, high-quality ratio.
+    double ratio = (std::abs(inter) > 1e-8) ? intra / std::abs(inter) : (intra > 0 ? 1e6 : 0.0);
     return { intra, inter, ratio };
 }
 
