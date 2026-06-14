@@ -1688,8 +1688,10 @@ public:
     // =================================================================
     void apply_gradients(fp32 lr) {
         if (!training_enabled) return;
+        std::printf("[DEBUG] model.apply_gradients(lr=%.2e) starting (step %d)...\n", lr, global_step); std::fflush(stdout);
 
         // 1. Auxiliary gradients
+        std::printf("[DEBUG]   Computing centroids and auxiliary gradients...\n"); std::fflush(stdout);
         std::vector<fp32> centroids(N_CLASSES * cfg.d);
         compute_class_centroids(master, cfg.V, cfg.d, centroids.data());
         backward_semantic(master, centroids.data(), cfg.V, cfg.d, s2_tau, s2_lambda_semantic);
@@ -1697,6 +1699,7 @@ public:
         backward_quant(master, cfg.V, cfg.d, cfg.B, s2_lambda_quant);
 
         // 2. Ortho gradient step on B
+        std::printf("[DEBUG]   Ortho gradient step on Basis...\n"); std::fflush(stdout);
         {
             std::vector<fp32> dBasis(static_cast<size_t>(cfg.d) * cfg.r, 0.0f);
             backward_ortho(cold.Basis.data(), dBasis.data(), cfg.d, cfg.r, s2_lambda_ortho);
@@ -1712,15 +1715,18 @@ public:
         }
 
         // 3. AdamW step on W_master
+        std::printf("[DEBUG]   AdamW update on MasterLatent...\n"); std::fflush(stdout);
         adam_W.update_all(master, lr, 0.9f, 0.999f, 1e-8f, 0.01f, &is_hot_set, s2_gamma_hot, s2_gamma_cold);
 
         // 4. Periodic QR re-orthogonalization
         if (global_step > 0 && global_step % s2_T_ortho == 0) {
+            std::printf("[DEBUG]   Periodic QR re-orthogonalization...\n"); std::fflush(stdout);
             gram_schmidt_qr(cold.Basis.data(), cfg.d, cfg.r);
         }
 
         // 5. Periodic tier reallocation
         if (global_step > 0 && global_step % s2_T_realloc == 0) {
+            std::printf("[DEBUG]   Periodic tier reallocation...\n"); std::fflush(stdout);
             auto old_hot = current_hot_ids;
             current_hot_ids = tier_alloc.reallocate(token_frequencies, cfg.K);
 
@@ -1739,10 +1745,12 @@ public:
         }
 
         // 6. Compress master to caches
+        std::printf("[DEBUG]   Compressing MasterLatent to tiered caches...\n"); std::fflush(stdout);
         compress_master(*this, master, current_hot_ids);
 
         ++global_step;
         master.zero_grad_master();
+        std::printf("[DEBUG] model.apply_gradients complete.\n"); std::fflush(stdout);
     }
 
 }; // end class HFAQE

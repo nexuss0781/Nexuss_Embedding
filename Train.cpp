@@ -665,8 +665,9 @@ int main(int argc, char** argv) {
     std::fflush(stdout);
 
     // ── build token frequency from training corpus ────────────────────────────
-    std::printf("[model] Computing token frequencies ...\n");
+    std::printf("[model] Computing token frequencies ...\n"); std::fflush(stdout);
     auto freq = corpus_frequencies(train_lines, cfg.V);
+    std::printf("[model] Frequency computation complete.\n"); std::fflush(stdout);
 
     // ── build model ───────────────────────────────────────────────────────────
     HFAQEConfig mcfg;
@@ -674,11 +675,17 @@ int main(int argc, char** argv) {
     mcfg.K = cfg.K; mcfg.B = cfg.B;
 
     HFAQE model(mcfg);
+    std::printf("[model] Building frequency tiers (K=%d) ...\n", cfg.K); std::fflush(stdout);
     model.build_frequency_tiers(freq);
+    
+    std::printf("[model] Initializing weights (SVD) ...\n"); std::fflush(stdout);
     model.initialize_weights(42);
+    
+    std::printf("[model] Pinning hot tier (mlock) ...\n"); std::fflush(stdout);
     model.pin_hot_tier();
 
     // Setup training state
+    std::printf("[model] Setting up unified training state ...\n"); std::fflush(stdout);
     model.setup_training();
 
     std::printf("[model] Hot=%d int8[%d×%d]  Cold=%d bf16[%d×%d]  Basis bf16[%d×%d]\n",
@@ -801,6 +808,7 @@ int main(int argc, char** argv) {
                 std::vector<std::thread>  threads;
                 threads.reserve(n_w);
 
+                std::printf("[DEBUG] Assembling batch of size %d with %d workers...\n", n_idx, n_w); std::fflush(stdout);
                 for (int w = 0; w < n_w; ++w) {
                     int lo = w * chunk;
                     int hi = std::min(lo + chunk, n_idx);
@@ -813,6 +821,7 @@ int main(int argc, char** argv) {
                     });
                 }
                 for (auto& t : threads) t.join();
+                std::printf("[DEBUG] Batch assembly complete.\n"); std::fflush(stdout);
                 for (auto& p : partial)
                     for (auto& seq : p)
                         batch.push_back(std::move(seq));
@@ -872,6 +881,7 @@ int main(int argc, char** argv) {
 
             // ── Validation ────────────────────────────────────────────────────
             if (model.global_step % cfg.val_every == 0) {
+                std::printf("\n[DEBUG] Starting validation at step %d...\n", model.global_step); std::fflush(stdout);
                 auto tv0      = std::chrono::high_resolution_clock::now();
                 float vloss   = run_validation(model, val_lines, cfg);
                 double vtime  = std::chrono::duration<double>(
@@ -880,17 +890,22 @@ int main(int argc, char** argv) {
                 monitor.log_val(model.global_step, vloss, vppl, vtime);
 
                 if (vloss < best_val_loss) {
+                    std::printf("[DEBUG] New best validation loss: %.4f. Saving 'best' checkpoint...\n", vloss); std::fflush(stdout);
                     best_val_loss = vloss;
                     best_val_ppl  = vppl;
                     save_ckpt("best");
+                    std::printf("[DEBUG] 'best' checkpoint save call returned.\n"); std::fflush(stdout);
                 }
+                std::printf("[DEBUG] Validation at step %d complete.\n", model.global_step); std::fflush(stdout);
             }
 
             // ── Periodic checkpoint ───────────────────────────────────────────
             if (model.global_step % cfg.save_every == 0) {
                 char tag[32];
                 std::snprintf(tag, sizeof(tag), "step_%07d", model.global_step);
+                std::printf("[DEBUG] Saving periodic checkpoint: %s\n", tag); std::fflush(stdout);
                 save_ckpt(tag);
+                std::printf("[DEBUG] periodic checkpoint save call returned.\n"); std::fflush(stdout);
             }
         } // end batch loop
 
