@@ -1279,12 +1279,12 @@ public:
     int s2_T_ortho = 50;
     fp32 s2_theta_clip = 1.0f;
     fp32 s2_tau = 0.05f;
-    fp32 s2_lambda_semantic = 0.2f;
-    fp32 s2_lambda_align = 0.01f;
+    fp32 s2_lambda_semantic = 0.1f;
+    fp32 s2_lambda_align = 0.1f;
     fp32 s2_lambda_ortho = 0.05f;
     fp32 s2_lambda_quant = 0.001f;
     fp32 s2_gamma_hot = 1.0f;
-    fp32 s2_gamma_cold = 2.0f;
+    fp32 s2_gamma_cold = 4.0f;
     fp32 s2_gamma_basis = 1.0f;
 
     explicit HFAQE(const HFAQEConfig& config) : cfg(config) {}
