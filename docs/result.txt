@@ -1,0 +1,28 @@
+╔══════════════════════════════════════════════════════════════╗
+║  HFAQE Empirical Semantic Capability Test                    ║
+╚══════════════════════════════════════════════════════════════╝
+[load] Loading checkpoint: checkpoints/hfaqe_best.nex...
+[load] Success. V=256 d=256 Step=300
+
+--- Semantic Grouping Tests ---
+Lowercase Letters        | "apple"         vs "banana"        | Similarity: 0.3596
+Uppercase Letters        | "APPLE"         vs "BANANA"        | Similarity: 0.3064
+Digits                   | "12345"         vs "67890"         | Similarity: 0.0172
+Mixed Alpha              | "Apple"         vs "Banana"        | Similarity: 0.0614
+
+--- Cross-Category Tests (Should be Low) ---
+Letters vs Digits        | "abcde"         vs "12345"         | Similarity: -0.0665
+Letters vs Symbols       | "hello"         vs "!@#$%"         | Similarity: -0.1085
+Case Mismatch            | "apple"         vs "APPLE"         | Similarity: -0.0024
+
+--- Structural/Morphological Similarity ---
+Prefix Overlap           | "transport"     vs "transplant"    | Similarity: 0.8292
+Suffix Overlap           | "walking"       vs "talking"       | Similarity: 0.8578
+Totally Different        | "elephant"      vs "xyzzy"         | Similarity: 0.0238
+
+--- Logic/Content Probes ---
+Synonyms (Approx)        | "cat"           vs "kitten"        | Similarity: 0.3927
+Numbers                  | "one"           vs "two"           | Similarity: 0.3713
+
+Test Completed.
+

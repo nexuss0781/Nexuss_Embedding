@@ -128,9 +128,10 @@ function(hfaqe_configure_target target)
 endfunction()
 
 # ---------------------------------------------------------------------------
-# Source directory (all .cpp files live alongside this CMakeLists.txt)
+# Directories
 # ---------------------------------------------------------------------------
-set(SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR})
+set(SRC_DIR  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+set(TEST_DIR ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 
 # ---------------------------------------------------------------------------
 # Target 1: hfaqe_main
@@ -139,7 +140,7 @@ set(SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 # ---------------------------------------------------------------------------
 add_executable(hfaqe_main ${SRC_DIR}/main.cpp)
 hfaqe_configure_target(hfaqe_main)
-# Include current source dir so #include "Core.cpp" etc. resolve
+# Include src/ so #include "Core.cpp" etc. resolve
 target_include_directories(hfaqe_main PRIVATE ${SRC_DIR})
 
 # ---------------------------------------------------------------------------
@@ -147,9 +148,18 @@ target_include_directories(hfaqe_main PRIVATE ${SRC_DIR})
 # Full §5 validation suite.
 # Single TU: Test.cpp includes Core.cpp via include-guard.
 # ---------------------------------------------------------------------------
-add_executable(hfaqe_test ${SRC_DIR}/Test.cpp)
+add_executable(hfaqe_test ${TEST_DIR}/Test.cpp)
 hfaqe_configure_target(hfaqe_test)
+# Include src/ so #include "Core.cpp" from tests/ resolve
 target_include_directories(hfaqe_test PRIVATE ${SRC_DIR})
+
+# ---------------------------------------------------------------------------
+# Target 3: hfaqe_semantic_test
+# Empirical capability test.
+# ---------------------------------------------------------------------------
+add_executable(hfaqe_semantic_test ${TEST_DIR}/Embedding_test.cpp)
+hfaqe_configure_target(hfaqe_semantic_test)
+target_include_directories(hfaqe_semantic_test PRIVATE ${SRC_DIR})
 
 # ---------------------------------------------------------------------------
 # CTest integration — register both targets as tests
