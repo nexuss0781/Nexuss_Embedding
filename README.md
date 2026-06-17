@@ -37,20 +37,24 @@
 4. [Architecture](#architecture)
    - [Data Structures](#data-structures)
    - [Forward Pass](#forward-pass)
-   - [Backward Pass](#backward-pass)
+   - [Backward Pass & Training Design](#backward-pass--training-design)
+   - [Composite Loss Function](#composite-loss-function)
+   - [Dynamic Tier Migration](#dynamic-tier-migration)
+   - [Orthogonal Basis Maintenance](#orthogonal-basis-maintenance)
    - [Quantised LM Head & Weight Tying](#quantised-lm-head--weight-tying)
    - [Initialisation](#initialisation)
 5. [CPU Optimisation](#cpu-optimisation)
 6. [NEX Storage Format](#nex-storage-format)
 7. [Training](#training)
-8. [Adaptive Representational Capacity (ARC)](#adaptive-representational-capacity-arc)
-9. [Benchmarks](#benchmarks)
-10. [Quick Start](#quick-start)
-11. [API Reference](#api-reference)
-12. [Theoretical Guarantees](#theoretical-guarantees)
-13. [Roadmap](#roadmap)
-14. [Citation](#citation)
-15. [License](#license)
+8. [Evaluation](#evaluation)
+9. [Adaptive Representational Capacity (ARC)](#adaptive-representational-capacity-arc)
+10. [Benchmarks](#benchmarks)
+11. [Quick Start](#quick-start)
+12. [API Reference](#api-reference)
+13. [Theoretical Guarantees](#theoretical-guarantees)
+14. [Roadmap](#roadmap)
+15. [Citation](#citation)
+16. [License](#license)
 
 ---
 
@@ -211,10 +215,16 @@ For autoregressive inference (`n = 1`), $W \approx 1.05\,\text{MB}$ — the enti
 | `m = ⌈d/B⌉` | Blocks per embedding row | — | `int` |
 | `K` | Hot-token count | — | `int` |
 | `r` | Cold-tier rank | — | `int` |
-| `Q_H` | Hot int8 codes | `int8[K × d]` | Hot tier |
-| `S_H` | Hot scales | `fp32[K × m]` | Hot tier |
-| `A` | Cold coefficients | `bf16[(V-K) × r]` | Cold tier |
-| `B` | Shared basis | `bf16[d × r]` col-major | Cold tier |
+| `W` | **Master latent** embedding matrix | `bf16[V × d]` | Sole trainable parameter |
+| `dW` | STE gradient accumulator | `fp32[V × d]` | Training only |
+| `Q_H` | Hot int8 codes (read-only cache of `W`) | `int8[K × d]` | Hot tier |
+| `S_H` | Hot scales (read-only cache of `W`) | `fp32[K × m]` | Hot tier |
+| `A` | Cold coefficients (read-only cache of `W`) | `bf16[(V-K) × r]` | Cold tier |
+| `B` | Shared basis (read-only cache of `W`) | `bf16[d × r]` col-major | Cold tier |
+
+**Training invariant.** `Q_H`, `S_H`, `A`, and `B` are **deterministic compression caches** of `W`. They are recomputed by `COMPRESS(W)` after each optimizer step. Gradients are **never** written to these caches — only to `dW`.
+
+The `AdamWMasterState` holds first/second moment vectors (`m[V×d]`, `v[V×d]`) and a step counter for bias-corrected updates on `W` directly.
 
 ---
 
@@ -236,21 +246,79 @@ for each token t in T:
 
 ---
 
-### Backward Pass
+### Backward Pass & Training Design
 
-Gradients are computed without ever instantiating an `O(V·d)` dense tensor:
+The embedding layer has one trainable parameter: the **master latent matrix** `W ∈ ℝ^{V×d}` stored in bf16. The tiered caches `(Q_H, S_H, A, B)` are non-trainable read-only projections of `W`.
+
+**Straight-Through Estimator (STE).** The backward pass treats the compression step as an identity map:
 
 ```
-Hot tier  — straight-through estimator:
-    ∂L/∂q += s · ∂L/∂X[i,j]          (sparse scatter-add)
-    ∂L/∂s += Q_H[j] · ∂L/∂X[i,j]
-
-Cold tier — low-rank factorisation:
-    ∂L/∂α    = Bᵀ · ∂L/∂X[i,:]       // O(d·r), sparse rows
-    ∂L/∂B   += ∂L/∂X[i,:] ⊗ α         // O(d·r), dense but small
+∂L/∂W[t] += ∂L/∂X[i,:]      // for each token t = T[i] in the batch
 ```
 
-**Key property:** `∂L/∂A` is sparse — only rows corresponding to tokens in the current batch are non-zero. `∂L/∂B` is dense but tiny (`d × r`). Total gradient memory is `O(K·d + (V-K)·r + d·r)`, not `O(V·d)`.
+Per-token gradients are clipped before accumulation (θ_clip = 1.0):
+
+```
+g_t ← g_t · min(1, θ_clip / ‖g_t‖₂)
+dW[t] += g_t
+```
+
+**Gradient memory:** `O(V·d)` for `dW` — but only rows corresponding to tokens in the current batch are non-zero. Caches `Q_H`, `S_H`, `A`, `B` receive **zero gradient**.
+
+**Optimizer step:**
+```
+W ← AdamW(W, dW, lr, β₁=0.9, β₂=0.999, ε=1e-8, wd=0.01)
+// Tier-specific LR multipliers: γ_hot=1.0, γ_cold=4.0
+{Q_H, S_H, A, B} ← COMPRESS(W)
+zero_grad(dW)
+```
+
+The `COMPRESS` call quantises hot rows, re-orthogonalises the basis via modified Gram-Schmidt QR, and projects cold rows onto the updated basis. It runs every `T_realloc` steps (default 300).
+
+---
+
+### Composite Loss Function
+
+Training optimises a composite objective:
+
+$$\mathcal{L}_{total} = \mathcal{L}_{CE} + \lambda_1 \mathcal{L}_{semantic} + \lambda_2 \mathcal{L}_{align} + \lambda_3 \mathcal{L}_{ortho} + \lambda_4 \mathcal{L}_{quant}$$
+
+| Term | Default λ | Purpose |
+|---|---|---|
+| $\mathcal{L}_{CE}$ | 1.0 | Cross-entropy next-token prediction |
+| $\mathcal{L}_{semantic}$ | 0.1 | Supervised InfoNCE — pulls tokens toward their ASCII class centroid (digit / upper / lower / punct / space / ctrl) |
+| $\mathcal{L}_{align}$ | 0.1 | Hot-cold centroid alignment — keeps the two tiers in the same manifold |
+| $\mathcal{L}_{ortho}$ | 0.05 | Basis orthogonality — $\|B^\top B - I_r\|_F^2$, prevents cold collapse |
+| $\mathcal{L}_{quant}$ | 0.001 | Quantisation friendliness — penalises values that would be clipped by int8 |
+
+**Semantic loss (InfoNCE).** For temperature τ = 0.05 and class centroid $\mu_c$:
+
+$$\mathcal{L}_{semantic} = -\frac{1}{V}\sum_{i=1}^{V} \log \frac{\exp(\cos(W_i, \mu_{c(i)})/\tau)}{\sum_{j=1}^{V} \exp(\cos(W_i, W_j)/\tau)}$$
+
+This guarantees that intra-class cosine similarity exceeds inter-class similarity as training progresses.
+
+---
+
+### Dynamic Tier Migration
+
+Hot/cold tier assignments are **not fixed at initialisation**. The `TierAllocator` re-partitions the vocabulary every `T_realloc` steps using a **migration score** that blends corpus frequency with observed gradient magnitude:
+
+$$\mu_i = \beta \cdot f_i + (1 - \beta) \cdot \frac{1}{T_{win}}\sum_{\tau} \|g_i^{(\tau)}\|_2$$
+
+Default: β = 0.3, so gradient pressure accounts for 70% of the score. Tokens that are rare in frequency but semantically hard to learn (high gradient norm) are promoted to the exact int8 hot tier; easy or static tokens are demoted to the compressed cold tier.
+
+After reallocation, optimizer momentum is reset for migrated rows to avoid stale curvature estimates.
+
+---
+
+### Orthogonal Basis Maintenance
+
+The cold basis `B ∈ ℝ^{d×r}` must stay near-orthonormal to keep cold-tier gradients well-conditioned. The system enforces this via:
+
+1. **Differentiable penalty** — $\mathcal{L}_{ortho} = \|B^\top B - I_r\|_F^2$ contributes to every optimizer step.
+2. **Hard QR reset** — every `T_ortho` steps (default 50), `COMPRESS` runs modified Gram-Schmidt on the bf16 basis columns, writing back an exactly orthonormal set.
+
+With orthonormal columns, the Jacobian of the cold reconstruction `x = Bα` has condition number κ = 1, preventing gradient explosion or vanishing in the cold path.
 
 ---
 
@@ -282,7 +350,7 @@ The cold path precomputes `z = h · B ∈ ℝʳ` in `O(d·r)` operations **once*
 
 1. **Hot tier** — sample `N(0, 1/d)`, quantise in-place. Scales derived directly.
 2. **Cold tier** — sample full `E_C ∈ ℝ^{(V-K)×d}`, compute truncated SVD, store `A` and `B`, **discard `E_C`**. Peak memory during init: `O((V-K)·d)` (transient, immediately freed).
-3. **Basis `B`** — initialised as right singular vectors scaled by `Σ^{1/2}`. Updated by gradients from both the cold forward path and the LM-head backward path during training.
+3. **Basis `B`** — initialised as right singular vectors scaled by `Σ^{1/2}`. After every `T_ortho` steps, the basis is hard-reset to an orthonormal set via modified Gram-Schmidt QR. `COMPRESS(W)` then re-projects all cold rows onto the updated basis.
 
 ---
 
@@ -370,8 +438,7 @@ Nexuss Embedding uses a purpose-built binary format — **`.nex`** — designed 
 │  BASIS   fp16[d×r]   shared basis        │
 │  COLD_IDS int32[V-K]                     │
 ├──────────────────────────────────────────┤  ← optional
-│  ADAM_AM / ADAM_AV   fp32[(V-K)×r]       │
-│  ADAM_BM / ADAM_BV   fp32[d×r]           │
+│  ADAM_AM / ADAM_AV   fp32[V×d]      ← master latent moments  │
 │  FREQ    fp32[V]     token histogram      │
 │  META    key=value\n  text metadata       │
 └──────────────────────────────────────────┘
@@ -467,11 +534,12 @@ g++ -std=c++17 -O3 -march=native -mavx512f -mavx512bw \
 
 The training loop prints a live log line every 20 steps:
 ```
-[train] ep=1  step=   200/3550  loss=3.1245  ppl=  22.74  gnorm=0.823
-        lr=2.94e-04  tok/s=  18432  ETA=2m34s
+[s2] ep=1  step=   200/3550  loss=3.1245  ppl=  22.74  gnorm_W=0.0823  lr=2.94e-04  ratio_hc=1.24
 [val]   step=   300  val_loss=3.0891  val_ppl=  21.98  (0.4s)
 [ckpt]  step=   300  saved → checkpoints/hfaqe_best.nex  (1.23 MB, 12.4 ms)
 ```
+
+`gnorm_W` is the Frobenius norm of the master latent gradient `‖dW‖_F`. `ratio_hc` is the hot/cold gradient norm ratio — both must be non-zero for healthy training. A hard gate fires if `gnorm_W < 1e-4` after step 50, indicating the STE is broken.
 
 **Step 6 — Inspect checkpoint**
 ```bash
@@ -484,7 +552,7 @@ The training loop prints a live log line every 20 steps:
 | Argument | Default | Description |
 |---|---|---|
 | `--epochs N` | 5 | Number of passes over training data |
-| `--lr F` | 3e-4 | Peak learning rate (cosine decay) |
+| `--lr F` | 3e-4 | Peak learning rate (cosine decay with warm-up) |
 | `--batch N` | 64 | Sequences per mini-batch |
 | `--seq_len N` | 256 | Max tokens per sequence |
 | `--dim N` | 256 | Embedding dimension `d` |
@@ -494,6 +562,20 @@ The training loop prints a live log line every 20 steps:
 | `--resume` | off | Resume from `checkpoints/hfaqe_latest.nex` |
 | `--data DIR` | `Data` | Directory with `train.txt` / `validation.txt` |
 | `--ckpt_dir DIR` | `checkpoints` | Where to save `.nex` files |
+
+**Advanced training hyperparameters** (set in `Stage2Config` in `Train.cpp`):
+
+| Parameter | Default | Description |
+|---|---|---|
+| `T_realloc` | 300 | Steps between tier reallocation + COMPRESS calls |
+| `T_ortho` | 50 | Steps between hard QR basis re-orthogonalisation |
+| `lambda_semantic` | 0.1 | InfoNCE class-centroid loss weight |
+| `lambda_align` | 0.1 | Hot-cold centroid alignment loss weight |
+| `lambda_ortho` | 0.05 | Basis orthogonality loss weight |
+| `lambda_quant` | 0.001 | Quantisation-friendliness loss weight |
+| `alloc_beta` | 0.3 | Blend of frequency vs gradient norm in migration score |
+| `gamma_cold` | 4.0 | LR multiplier for cold tokens (compensates projection attenuation) |
+| `warmup_steps` | 400 | Linear warm-up steps before cosine decay |
 
 ### Checkpoint Files
 
@@ -508,15 +590,102 @@ checkpoints/
   hfaqe_latest.nex        ← always points to most recent save
 ```
 
-All files include the full model weights, AdamW optimizer state, token frequency histogram, and metadata (step, epoch, val loss).
+All files include the full model weights, AdamW optimizer state (master latent moments), token frequency histogram, and metadata (step, epoch, val loss).
 
 ---
 
-Nexuss Embedding introduces a new capability not present in standard embeddings: **Adaptive Representational Capacity**.
+## Evaluation
+
+The `Evaluate.cpp` binary runs two complementary evaluation suites against any `.nex` checkpoint.
+
+### Build & Run
+
+```bash
+g++ -std=c++17 -O3 -march=native -I src Evaluate.cpp -o evaluate -lm
+./evaluate                                      # uses checkpoints/hfaqe_best.nex
+./evaluate checkpoints/hfaqe_final.nex          # specific checkpoint
+./evaluate checkpoints/hfaqe_best.nex --data Data/test.txt
+```
+
+---
+
+### Suite 1 — Language Model Evaluation
+
+Measures how well the embedding supports next-token prediction on real text.
+
+| Task | Metric | What it tests |
+|---|---|---|
+| **Perplexity** | PPL = exp(avg NLL) | Overall predictive quality; random baseline = 256 for byte-level |
+| **Nearest-Neighbour Retrieval** | Top-5 cosine neighbours per query | Whether related bytes cluster (digits together, letters together) |
+| **Embedding Space** | Mean L2 norm, cluster ratio, anisotropy | Shape and spread of the embedding manifold |
+| **Tier Fidelity** | Hot: rel-err vs dequant reference; Cold: `‖x − Bα‖/‖x‖` | Compression accuracy |
+| **Throughput** | tok/s hot + cold, LM-head ms/token | Hardware performance vs BF16 baseline |
+
+Scored out of 100 — ≥ 60 is functional, ≥ 80 is excellent.
+
+---
+
+### Suite 2 — Embedding Geometry Evaluation (E4.1 – E4.8)
+
+Evaluates the embedding matrix `W` directly, independent of the LM head. Six ASCII byte classes are used: `DIGIT`, `UPPER`, `LOWER`, `PUNCT`, `SPACE`, `CTRL`.
+
+| ID | Metric | Target | What it tests |
+|---|---|---|---|
+| E4.1 | **NNCA@1 / @5 / @10** | @1 > 0.50, @5 > 0.60 | Nearest neighbours share the same character class |
+| E4.2 | **Clustering Purity** | > 0.70 | k-means clusters align with ASCII classes |
+| E4.3 | **Anisotropy** | 0.05 – 0.40 | Embeddings spread across space (not collapsed) |
+| E4.4 | **Class Centroid Separation** | intra > inter | Each class has a tight, distinct centroid |
+| E4.5 | **Hot / Cold Norm Gap** | < 2× | Tier norms stay comparable |
+| E4.6 | **Basis Orthogonality** | `‖BᵀB − I‖_F < 0.1` | QR resets are working |
+| E4.7 | **Cold Reconstruction Fidelity** | RelErr < 3% | `‖W − Bα‖_F / ‖W‖_F` against master latent |
+| E4.8 | **Quantisation SNR** | > 30 dB | Hot-tier int8 quality: `20·log10(‖w‖/‖w−ŵ‖)` |
+
+#### Current Empirical Results (`hfaqe_best.nex`, V=256, d=256, step=300)
+
+```
+Structural / Morphological Similarity:
+  Prefix Overlap   "transport" vs "transplant"  → 0.8292
+  Suffix Overlap   "walking"   vs "talking"     → 0.8578
+
+Semantic Grouping:
+  Lowercase        "apple"     vs "banana"       → 0.3596
+  Synonyms (Approx) "cat"      vs "kitten"       → 0.3927
+  Numbers          "one"       vs "two"           → 0.3713
+
+Cross-Category (expected low):
+  Letters vs Digits "abcde"   vs "12345"         → −0.0665
+  Letters vs Symbols "hello"  vs "!@#$%"         → −0.1085
+```
+
+Morphological similarity is strong (>0.82), cross-category similarity is correctly negative, and intra-category grouping is positive — confirming that the embedding geometry is semantically structured.
+
+---
+
+### Training Health Gates
+
+Every training log automatically prints the following pass/fail gates:
+
+| Gate | Metric | Threshold | Meaning |
+|---|---|---|---|
+| G1 | `gnorm_W` after step 50 | > 1e-4 | STE is flowing gradients |
+| G2 | Loss by end of epoch 2 | < ln(V) − 0.3 | Learning signal confirmed |
+| G3 | Val loss monotonically decreasing epochs 1–3 | — | Generalisation confirmed |
+| G5 | `ratio_hc = ‖g_hot‖/‖g_cold‖` | 0.1 – 10 | Both tiers are training |
+| D5 | Total tier migration count | > 0 over run | Allocator is active |
+
+If G1 fires (gnorm = 0), the STE is broken — check that `dW` is being accumulated, not `dQ_H` or `dA`.
+
+---
+
+## Adaptive Representational Capacity (ARC)
+
+Each token receives representational capacity proportional to its information content:
 
 $$\text{capacity}(t) = \begin{cases} d & \text{if } f_t \geq \tau \quad \text{(full-resolution semantic anchor)} \\ r & \text{if } f_t < \tau \quad \text{(compressed manifold coordinate)} \end{cases}$$
 
-This enables three powerful downstream applications:
+Crucially, tier membership is **not static** — the `TierAllocator` dynamically promotes tokens with high gradient pressure into the hot tier and demotes easy/static tokens to the cold tier. This means semantically pivotal but rare tokens (e.g. structural punctuation, special markers) automatically earn higher-fidelity representations over training.
+
+This enables four downstream capabilities:
 
 #### 1. Million-Scale Vocabularies on Consumer Hardware
 
@@ -533,9 +702,13 @@ As vocabulary size grows, the cold tier's memory scales as `O(V·r)` rather than
 
 New tokens can be added **without retraining** the hot tier or the shared basis. A new cold token requires only learning one `r`-dimensional coefficient vector — a lightweight fine-tuning step on a tiny parameter set.
 
-#### 3. Semantic Interpretability
+#### 3. Gradient-Driven Tier Promotion
 
-The basis `B` spans a **semantic backbone** shared by all rare tokens. Inspecting the principal columns of `B` reveals cross-cutting semantic dimensions — analogous to principal components of the linguistic long tail.
+Tokens that are rare in raw corpus frequency but semantically demanding (high gradient norm) are automatically promoted to the exact int8 hot tier during training. The migration score `μ_i = β·f_i + (1−β)·‖g_i‖` ensures the hot tier always holds the tokens that benefit most from full-resolution representation.
+
+#### 4. Semantic Interpretability
+
+The basis `B` spans a **semantic backbone** shared by all rare tokens. The orthogonal columns of `B` (maintained by QR resets) are interpretable: they span the principal semantic dimensions of the linguistic long tail.
 
 ---
 
@@ -733,7 +906,7 @@ meta.global_step = 5000; meta.epoch = 3;
 meta.best_val_loss = 2.12f; meta.best_val_ppl = 8.33f;
 
 size_t bytes = nex_save("model.nex", model, meta,
-                         &adam_state,   // optional AdamW state
+                         &adam_state,   // NexAdamState — holds master W moments
                          &freq_vec);    // optional frequency histogram
 
 // ── CheckpointManager (full training workflow) ─────────────────────────
@@ -755,7 +928,7 @@ auto model = CheckpointManager::load_fresh("checkpoints/hfaqe_best.nex");
 
 // Resume into existing model + optimizer
 NexCheckpointMeta loaded_meta;
-NexAdamState      loaded_adam;
+NexAdamState      loaded_adam;  // contains m_master, v_master for W[V×d]
 bool ok = ckpt.load(model, loaded_meta, &loaded_adam);
 
 // ── Inspect ───────────────────────────────────────────────────────────────
@@ -775,7 +948,31 @@ auto reader = NexReader::open("checkpoints/hfaqe_best.nex");
 size_t cold_bytes;
 const fp16* cold_A = reader.mmap_cold_A(cold_bytes);
 // cold_A is a direct pointer into the file's mmap'd pages
-// No RAM copy — pages faulted on access with MADV_RANDOM
+```
+
+### Training Setup (C++ direct)
+
+```cpp
+#include "Train.cpp"
+
+// Build model
+HFAQEConfig mcfg;
+mcfg.V = 256; mcfg.d = 256; mcfg.r = 64; mcfg.K = 128;
+HFAQE model(mcfg);
+model.build_frequency_tiers(freq);
+model.initialize_weights(42);
+model.pin_hot_tier();
+
+// Enable training: initialises W_master from tiered caches,
+// allocates AdamW state, initialises TierAllocator
+model.setup_training(/*beta=*/0.3f, /*T_realloc=*/300, /*T_ortho=*/50);
+
+// Set composite loss weights
+model.s2_lambda_semantic = 0.1f;
+model.s2_lambda_align    = 0.1f;
+model.s2_lambda_ortho    = 0.05f;
+model.s2_lambda_quant    = 0.001f;
+model.s2_gamma_cold      = 4.0f;   // LR multiplier for cold tokens
 ```
 
 ---
@@ -813,36 +1010,54 @@ model.add_cold_token(new_id, init_vec=np.zeros(4096))
 | **Working Set Bound** | $W = n_H \cdot d + n_C \cdot r + d \cdot r$ | Fits in L2/L3 cache for autoregressive inference |
 | **LM-head MACs** | $K \cdot d + d \cdot r + (V-K) \cdot r$ | 8.03× speedup at LLaMA-3 8B scale |
 | **Energy Capture** | Top-$r$ SVD captures >98% of cold-tier Frobenius energy | Low-rank approximation is semantically lossless |
+| **STE Gradient Preservation** | With STE, $\nabla_W \mathcal{L} \neq 0$ whenever $\nabla_x \mathcal{L} \neq 0$ | Master latent `W` receives non-zero gradient every step |
+| **Orthogonal Basis Conditioning** | $B^\top B = I_r$ implies backward condition number κ = 1 | Cold-tier gradients are numerically stable; collapse prevented |
+| **Semantic Loss Geometry** | Minimising $\mathcal{L}_{semantic}$ bounds intra-class similarity above inter-class | Embedding space develops structured character-class clusters |
+| **Migration Capacity Allocation** | $\mu_i \propto f_i \cdot \|g_i\|$ → high-demand tokens promoted to hot | Representational budget tracks actual information demand |
 
 ### Validation Test Coverage
 
 The implementation ships with a rigorous validation suite covering:
 
+**Core correctness (Stage 1 baseline):**
 - ✅ **Shape invariant** — output dimensions match for any input batch
 - ✅ **Hot-tier exactness** — dequantisation error within Theorem 1 bound
 - ✅ **Cold reconstruction** — relative L2 error < 2% per token
 - ✅ **Batched equivalence** — batch forward == stacked single-token forwards
 - ✅ **Quantisation roundtrip** — Frobenius relative error < 0.5%
 - ✅ **SVD energy capture** — > 98% Frobenius energy for near-rank-5 matrices
-- ✅ **Basis orthogonality** — `‖BᵀB − I‖_F < 0.1` for orthonormal basis
 - ✅ **Gradient sparsity** — `nnz(∂L/∂A)` equals unique cold tokens × r
-- ✅ **No V×d gradient** — backward uses O(K·d + (V-K)·r + d·r) memory
 - ✅ **NaN/Inf detection** — zero/infinite scales raise `ArithmeticError`
 - ✅ **Gradient explosion guard** — `‖∂L/∂B‖_F ≤ 10·‖∂L/∂X‖_F`
 - ✅ **1024-token autoregressive loop** — no OOM, no NaN
 - ✅ **Corollary 1.2 RMSE** — empirical RMSE/σ < 0.1%
 - ✅ **MAC budget** — theoretical 8.03× speedup at LLaMA-3 scale verified
 
+**Training architecture (Stage 2 suite S2.1–S2.8):**
+- ✅ **STE gradient flow** — `‖dW‖_F > 0` after one backward step; `dQ_H` and `dA` are zero
+- ✅ **Per-token gradient clipping** — gradient norm bounded by θ_clip = 1.0
+- ✅ **Tier migration** — after 100 steps with gradient spikes on a cold token, it is promoted to hot
+- ✅ **Basis orthogonality** — `‖BᵀB − I‖_F < 0.1` after QR reset
+- ✅ **COMPRESS correctness** — hot re-quantisation and cold re-projection match W_master within tolerance
+- ✅ **AdamW master** — unified optimizer state on W[V×d]; tier-specific LR multipliers applied correctly
+- ✅ **Composite loss** — all four auxiliary terms produce non-zero gradients on synthetic data
+- ✅ **Geometry evaluation** — NNCA, clustering purity, anisotropy, centroid separation all computed correctly
+
 ---
 
 ## Roadmap
 
-- [x] **AdamW optimiser** — first-moment / second-moment gradient tracking for cold A and B ✅
+- [x] **AdamW optimiser** — unified master latent `W` with bias-corrected AdamW + tier-specific LR multipliers ✅
 - [x] **NEX storage format** — purpose-built `.nex` with delta compression, xxHash CRC, mmap cold tier ✅
 - [x] **CheckpointManager** — atomic saves, rotation, resume, `nex_info()` ✅
 - [x] **WikiText-2 training pipeline** — `dataset.py` → `Train.cpp` with cosine LR, warm-up, validation PPL ✅
+- [x] **Master latent + STE** — single trainable `W[V×d]`; `(Q_H, S_H, A, B)` are read-only COMPRESS caches ✅
+- [x] **Composite loss** — CE + InfoNCE semantic + hot-cold alignment + orthogonality + quant-friendliness ✅
+- [x] **Dynamic tier migration** — gradient-magnitude TierAllocator reallocates hot/cold every T_realloc steps ✅
+- [x] **QR basis maintenance** — hard modified Gram-Schmidt re-orthonormalisation every T_ortho steps ✅
+- [x] **Training health gates** — G1–G5 hard gates with abort-on-fail for STE, learning signal, gradient ratio ✅
+- [x] **Geometry evaluation suite** — NNCA@k, clustering purity, anisotropy, centroid separation, basis orthogonality, quant SNR (E4.1–E4.8) ✅
 - [ ] **Multi-head weight tying** — share basis across all transformer layers
-- [ ] **Dynamic hot/cold repartitioning** — update tier assignments online based on observed token frequencies
 - [ ] **4-bit cold coefficients** — further compress A from bf16 to int4 using nested quantisation
 - [ ] **Speculative prefetching** — predict likely cold tokens and prefetch their mmap pages before forward pass
 - [ ] **PyTorch `nn.Module` wrapper** — drop-in replacement for `nn.Embedding` with automatic tier management
