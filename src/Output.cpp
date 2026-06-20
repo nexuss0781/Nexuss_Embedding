@@ -297,6 +297,10 @@ public:
     const fp16* basis_ptr() const { return model_->basis_ptr(); }
     fp16*       basis_ptr()       { return model_->basis_ptr(); }
 
+    // ---- Training: expose underlying HFAQE model ----
+    HFAQE* raw_model() { return model_.get(); }
+    const HFAQE* raw_model() const { return model_.get(); }
+
     // -----------------------------------------------------------------
     // §7 — ARC: Dynamic vocabulary expansion
     // Adds a new cold token at runtime by learning only an r-dimensional
