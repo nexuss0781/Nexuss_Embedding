@@ -4,21 +4,26 @@
 #ifndef HFAQE_INPUT_CPP
 #define HFAQE_INPUT_CPP
 //
-// Tokenizer interface (from input/Tokenizer.md):
-//   - Python class Tokenizer at ../Component-1.1_Tokenizer/tokenizer.py
-//   - tok.encode(str)             → List[int]
-//   - tok.encode_batch(List[str]) → List[List[int]]
-//   - tok.vocab_size              → 16000 (V)
-//   - Callable: tok(str|List[str])
-//   - Truncation: tok.encode(str, truncation=True, max_length=N)
+// Tokenizer pipeline:
+//   Component 1.1 (C++ Tokenizer) → Component 1.2 (HFAQE Embedding)
 //
 // This file provides:
-//   1. TokenizerBridge — embeds the Python tokenizer via pybind11
-//   2. encode_and_embed() — full pipeline: text → IDs → embeddings
-//   3. A standalone C++ tokenizer adapter stub for compile-time testing
+//   1. TokenizerBridge — wraps the C++ Tokenizer (Component 1.1)
+//      with optional pybind11/Python path for production Amharic BBPE
+//   2. EmbedPipeline — full pipeline: text → IDs → embeddings (fp32)
 // =============================================================================
 
 #include "Core.cpp"
+
+// ---------------------------------------------------------------------------
+// Component 1.1 — C++ Tokenizer (cognition-optimized BPE)
+//   LOUDS trie, CHD decoder, greedy longest-prefix encode
+// ---------------------------------------------------------------------------
+#include "../../Component-1.1_Tokenizer/core.hpp"
+#ifndef TOKENIZER_CORE_IMPLEMENTED
+#define TOKENIZER_CORE_IMPLEMENTED
+#include "../../Component-1.1_Tokenizer/core.cpp"
+#endif
 
 // ---------------------------------------------------------------------------
 // pybind11 integration (available when building the Python extension)
@@ -33,35 +38,40 @@ namespace py = pybind11;
 #include <vector>
 #include <stdexcept>
 #include <cstdio>
+#include <memory>
 
 // =============================================================================
-// TokenizerBridge — wraps the Python EthioBBPE tokenizer
-// Loaded once at program start, kept alive for the embedding session.
+// TokenizerBridge — wraps the C++ Tokenizer (Component 1.1)
+// with optional fallback to Python EthioBBPE via pybind11.
+//
+// Default mode (no HFAQE_WITH_PYBIND11): pure C++ tokenizer
+//   - tokenizer_path: optional path to a .tok vocabulary file
+//   - If empty, builds a default byte-level vocabulary (V=256)
+//
+// Python mode (HFAQE_WITH_PYBIND11): calls EthioBBPE via pybind11
+//   - tokenizer_path: path to the Python tokenizer module directory
+//   - Requires Python + EthioBBPE + pybind11
 // =============================================================================
 class TokenizerBridge {
 public:
     int vocab_size = 0;
 
-    // -----------------------------------------------------------------
-    // Constructor: import the tokenizer module and instantiate.
-    // Module path: "../Component-1.1_Tokenizer/tokenizer"  (relative import)
-    // -----------------------------------------------------------------
-    explicit TokenizerBridge(const std::string& module_path = "") {
+    explicit TokenizerBridge(const std::string& config_path = "",
+                             int default_vocab_size = 256)
+        : default_vocab_size_(default_vocab_size) {
 #ifdef HFAQE_WITH_PYBIND11
+        // ---- Python EthioBBPE path (requires pybind11) ----
         if (!py::interpreter_is_alive()) {
             throw std::runtime_error(
                 "TokenizerBridge: Python interpreter not started. "
                 "Call pybind11::initialize_interpreter() first.");
         }
         try {
-            // Add the tokenizer's parent directory to sys.path
             py::module_ sys = py::module_::import("sys");
-            std::string path = module_path.empty()
+            std::string path = config_path.empty()
                 ? "../Component-1.1_Tokenizer"
-                : module_path;
+                : config_path;
             sys.attr("path").attr("insert")(0, path);
-
-            // Import and instantiate
             py::module_ tok_mod = py::module_::import("tokenizer");
             tok_obj_ = tok_mod.attr("Tokenizer")();
             vocab_size = tok_obj_.attr("vocab_size").cast<int>();
@@ -70,18 +80,39 @@ public:
                 std::string("TokenizerBridge: failed to load tokenizer: ") + e.what());
         }
 #else
-        // Stub: in a pure C++ build without pybind11, use the mock tokenizer
-        vocab_size = 16000; // EthioBBPE default (Tokenizer.md §Scope)
-        (void)module_path;
-        std::fprintf(stderr,
-            "[TokenizerBridge] pybind11 not available — running in stub mode\n");
+        // ---- C++ Tokenizer path (Component 1.1, pure C++) ----
+        cpp_tok_ = std::make_unique<tokenizer::Tokenizer>();
+        if (!config_path.empty()) {
+            if (!cpp_tok_->load(config_path)) {
+                std::fprintf(stderr,
+                    "[TokenizerBridge] Warning: failed to load vocab '%s', "
+                    "building byte-level fallback\n", config_path.c_str());
+                build_default_vocab();
+            }
+        } else {
+            build_default_vocab();
+        }
+        vocab_size = (int)cpp_tok_->vocab_size();
 #endif
     }
 
-    // -----------------------------------------------------------------
-    // encode: single string → token ID list
-    // Wraps: tok.encode(text, truncation=truncate, max_length=max_len)
-    // -----------------------------------------------------------------
+    // Build a byte-level vocabulary of default_vocab_size_ entries.
+    // First 256 entries are individual bytes 0x00-0xFF; beyond that we
+    // synthesize unique placeholders so the size matches embedder->cfg.V.
+    void build_default_vocab() {
+        int n = std::max(1, default_vocab_size_);
+        std::vector<std::string> v;
+        v.reserve(n);
+        for (int i = 0; i < n; i++) {
+            if (i < 256)
+                v.push_back(std::string(1, (char)i));
+            else
+                v.push_back("[byte-" + std::to_string(i) + "]");
+        }
+        cpp_tok_->set_vocab(v);
+    }
+
+    // ---- Encode single string → token IDs ----
     std::vector<int> encode(const std::string& text,
                             bool truncation = false,
                             int  max_length = 512) const {
@@ -102,22 +133,15 @@ public:
                 std::string("TokenizerBridge::encode failed: ") + e.what());
         }
 #else
-        // Stub: deterministic hash-based encoding for offline testing
-        std::vector<int> ids;
-        ids.reserve(text.size());
-        for (unsigned char c : text) {
-            int tok = static_cast<int>(c) % vocab_size;
-            ids.push_back(tok);
-            if (truncation && (int)ids.size() >= max_length) break;
-        }
-        return ids;
+        auto ids = cpp_tok_->encode(text);
+        std::vector<int> result(ids.begin(), ids.end());
+        if (truncation && (int)result.size() > max_length)
+            result.resize(max_length);
+        return result;
 #endif
     }
 
-    // -----------------------------------------------------------------
-    // encode_batch: list of strings → list of token ID lists
-    // Wraps: tok.encode_batch(texts)
-    // -----------------------------------------------------------------
+    // ---- Encode batch of strings ----
     std::vector<std::vector<int>> encode_batch(
         const std::vector<std::string>& texts) const
     {
@@ -138,7 +162,7 @@ public:
 #endif
     }
 
-    // Callable shorthand: tok(text) or tok(texts)
+    // Callable shorthand
     std::vector<int> operator()(const std::string& text) const {
         return encode(text);
     }
@@ -147,9 +171,21 @@ public:
         return encode_batch(texts);
     }
 
+    // ---- Access to underlying C++ tokenizer ----
+    tokenizer::Tokenizer* cpp_tokenizer() const {
+#ifndef HFAQE_WITH_PYBIND11
+        return cpp_tok_.get();
+#else
+        return nullptr;
+#endif
+    }
+
 private:
+    int default_vocab_size_ = 256;
 #ifdef HFAQE_WITH_PYBIND11
-    mutable py::object tok_obj_;
+    py::object tok_obj_;
+#else
+    std::unique_ptr<tokenizer::Tokenizer> cpp_tok_;
 #endif
 };
 
@@ -166,7 +202,7 @@ public:
     // -----------------------------------------------------------------
     explicit EmbedPipeline(HFAQE* emb,
                            const std::string& tokenizer_module_path = "")
-        : tokenizer(tokenizer_module_path), embedder(emb)
+        : tokenizer(tokenizer_module_path, emb ? emb->cfg.V : 256), embedder(emb)
     {
         if (!embedder)
             throw std::invalid_argument("EmbedPipeline: embedder must not be null");
